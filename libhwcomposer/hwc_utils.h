@@ -103,6 +103,7 @@ struct ListStats {
     // This will be set to true during animation, otherwise false.
     bool isDisplayAnimating;
     ovutils::Dim roi;
+    bool secureUI; // Secure display layer
 };
 
 struct LayerProp {
@@ -342,6 +343,11 @@ static inline int getHeight(const private_handle_t* hnd) {
         }
     }
     return hnd->height;
+}
+
+//Return true if the buffer is intended for Secure Display
+static inline bool isSecureDisplayBuffer(const private_handle_t* hnd) {
+    return (hnd && (hnd->flags & private_handle_t::PRIV_FLAGS_SECURE_DISPLAY));
 }
 
 template<typename T> inline T max(T a, T b) { return (a > b) ? a : b; }
