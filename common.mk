@@ -8,19 +8,21 @@ common_includes += hardware/qcom/display/libexternal
 common_includes += hardware/qcom/display/libqservice
 common_includes += hardware/qcom/display/libvirtual
 
-ifeq ($(TARGET_USES_POST_PROCESSING),true)
-    common_flags     += -DUSES_POST_PROCESSING
-    common_includes  += $(TARGET_OUT_HEADERS)/pp/inc
-endif
+# Temporarily disable POST_PROCESSING for KK bringup
+#ifeq ($(TARGET_USES_POST_PROCESSING),true)
+#    common_flags     += -DUSES_POST_PROCESSING
+#    common_includes  += $(TARGET_OUT_HEADERS)/pp/inc
+#endif
 
 common_header_export_path := qcom/display
 
 #Common libraries external to display HAL
 common_libs := liblog libutils libcutils libhardware
 
-ifeq ($(TARGET_USES_POST_PROCESSING),true)
-    common_libs += libmm-abl
-endif
+# Temporarily disable POST_PROCESSING for KK bringup
+#ifeq ($(TARGET_USES_POST_PROCESSING),true)
+#    common_libs += libmm-abl
+#endif
 
 #Common C flags
 common_flags := -DDEBUG_CALC_FPS -Wno-missing-field-initializers
@@ -45,11 +47,12 @@ endif
 common_deps  :=
 kernel_includes :=
 
+# Temporarily disable QCOM Display features on KK
 # Executed only on QCOM BSPs
-ifeq ($(TARGET_USES_QCOM_BSP),true)
+#ifeq ($(TARGET_USES_QCOM_BSP),true)
 # Enable QCOM Display features
-    common_flags += -DQCOM_BSP
-endif
+#    common_flags += -DQCOM_BSP
+#endif
 ifneq ($(call is-platform-sdk-version-at-least,18),true)
     common_flags += -DANDROID_JELLYBEAN_MR1=1
 endif
