@@ -199,6 +199,11 @@ inline bool isNonIntegralSourceCrop(const hwc_frect_t& cropF) {
 // -----------------------------------------------------------------------------
 // Utility functions - implemented in hwc_utils.cpp
 void dumpLayer(hwc_layer_1_t const* l);
+
+// Calculate viewframe for external/primary display from primary resolution and
+// primary device orientation
+hwc_rect_t calculateDisplayViewFrame(hwc_context_t *ctx, int dpy);
+
 void setListStats(hwc_context_t *ctx, hwc_display_contents_1_t *list,
         int dpy);
 void initContext(hwc_context_t *ctx);
@@ -240,9 +245,6 @@ bool isActionSafePresent(hwc_context_t *ctx, int dpy);
 
 /* Calculates the destination position based on the action safe rectangle */
 void getActionSafePosition(hwc_context_t *ctx, int dpy, hwc_rect_t& dst);
-
-void getAspectRatioPosition(int destWidth, int destHeight, int srcWidth,
-                                int srcHeight, hwc_rect_t& rect);
 
 void getAspectRatioPosition(hwc_context_t* ctx, int dpy, int extOrientation,
                                 hwc_rect_t& inRect, hwc_rect_t& outRect);
@@ -354,16 +356,6 @@ static inline bool isBufferLocked(const private_handle_t* hnd) {
 //Return true if buffer is for external display only
 static inline bool isExtOnly(const private_handle_t* hnd) {
     return (hnd && (hnd->flags & private_handle_t::PRIV_FLAGS_EXTERNAL_ONLY));
-}
-
-//Return true if buffer is for external display only with a BLOCK flag.
-static inline bool isExtBlock(const private_handle_t* hnd) {
-    return (hnd && (hnd->flags & private_handle_t::PRIV_FLAGS_EXTERNAL_BLOCK));
-}
-
-//Return true if buffer is for external display only with a Close Caption flag.
-static inline bool isExtCC(const private_handle_t* hnd) {
-    return (hnd && (hnd->flags & private_handle_t::PRIV_FLAGS_EXTERNAL_CC));
 }
 
 //Return true if the buffer is intended for Secure Display
@@ -486,6 +478,10 @@ struct hwc_context_t {
 
     // Panel reset flag will be set if BTA check fails
     bool mPanelResetStatus;
+
+    // Downscale feature switch, set via system the property
+    // sys.hwc.mdp_downscale_enabled
+    bool mMDPDownscaleEnabled;
 };
 
 namespace qhwc {
@@ -504,6 +500,11 @@ static inline bool has90Transform(hwc_layer_1_t *layer) {
 
 inline bool isSecurePresent(hwc_context_t *ctx, int dpy) {
     return ctx->listStats[dpy].isSecurePresent;
+}
+
+static inline bool isSecondaryConnected(hwc_context_t* ctx) {
+    return (ctx->dpyAttr[HWC_DISPLAY_EXTERNAL].connected ||
+    ctx->dpyAttr[HWC_DISPLAY_VIRTUAL].connected);
 }
 
 };

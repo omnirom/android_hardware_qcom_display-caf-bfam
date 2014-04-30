@@ -43,6 +43,7 @@
 #include "hwc_qclient.h"
 #include "QService.h"
 #include "comptype.h"
+#include "qd_utils.h"
 
 using namespace qClient;
 using namespace qService;
@@ -198,6 +199,16 @@ void initContext(hwc_context_t *ctx)
     // Initialize device orientation to its default orientation
     ctx->deviceOrientation = 0;
     ctx->mBufferMirrorMode = false;
+    ctx->mVPUClient = NULL;
+
+    // Read the system property to determine if downscale feature is enabled.
+    ctx->mMDPDownscaleEnabled = false;
+    char value[PROPERTY_VALUE_MAX];
+    if(property_get("sys.hwc.mdp_downscale_enabled", value, "false")
+            && !strcmp(value, "true")) {
+        ctx->mMDPDownscaleEnabled = true;
+    }
+
 #ifdef VPU_TARGET
     ctx->mVPUClient = new VPUClient();
 #endif
@@ -348,34 +359,6 @@ void getActionSafePosition(hwc_context_t *ctx, int dpy, hwc_rect_t& rect) {
     return;
 }
 
-/* Calculates the aspect ratio for based on src & dest */
-void getAspectRatioPosition(int destWidth, int destHeight, int srcWidth,
-                                int srcHeight, hwc_rect_t& rect) {
-   int x =0, y =0;
-
-   if (srcWidth * destHeight > destWidth * srcHeight) {
-        srcHeight = destWidth * srcHeight / srcWidth;
-        srcWidth = destWidth;
-    } else if (srcWidth * destHeight < destWidth * srcHeight) {
-        srcWidth = destHeight * srcWidth / srcHeight;
-        srcHeight = destHeight;
-    } else {
-        srcWidth = destWidth;
-        srcHeight = destHeight;
-    }
-    if (srcWidth > destWidth) srcWidth = destWidth;
-    if (srcHeight > destHeight) srcHeight = destHeight;
-    x = (destWidth - srcWidth) / 2;
-    y = (destHeight - srcHeight) / 2;
-    ALOGD_IF(HWC_UTILS_DEBUG, "%s: AS Position: x = %d, y = %d w = %d h = %d",
-             __FUNCTION__, x, y, srcWidth , srcHeight);
-    // Convert it back to hwc_rect_t
-    rect.left = x;
-    rect.top = y;
-    rect.right = srcWidth + rect.left;
-    rect.bottom = srcHeight + rect.top;
-}
-
 // This function gets the destination position for Seconday display
 // based on the position and aspect ratio with orientation
 void getAspectRatioPosition(hwc_context_t* ctx, int dpy, int extOrientation,
@@ -427,8 +410,8 @@ void getAspectRatioPosition(hwc_context_t* ctx, int dpy, int extOrientation,
     xRatio = (inPos.x - viewFrame.left)/actualWidth;
     yRatio = (inPos.y - viewFrame.top)/actualHeight;
     // Use viewframe width and height to compute wRatio and hRatio.
-    wRatio = inPos.w/(viewFrame.right - viewFrame.left);
-    hRatio = inPos.h/(viewFrame.bottom - viewFrame.top);
+    wRatio = (float)inPos.w/(float)(viewFrame.right - viewFrame.left);
+    hRatio = (float)inPos.h/(float)(viewFrame.bottom - viewFrame.top);
 
 
     //Calculate the position...
@@ -738,6 +721,28 @@ static void trimList(hwc_context_t *ctx, hwc_display_contents_1_t *list,
     }
 }
 
+hwc_rect_t calculateDisplayViewFrame(hwc_context_t *ctx, int dpy) {
+    int dstWidth = ctx->dpyAttr[dpy].xres;
+    int dstHeight = ctx->dpyAttr[dpy].yres;
+    int srcWidth = ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres;
+    int srcHeight = ctx->dpyAttr[HWC_DISPLAY_PRIMARY].yres;
+    // default we assume viewframe as a full frame for primary display
+    hwc_rect outRect = {0, 0, dstWidth, dstHeight};
+    if(dpy) {
+        // swap srcWidth and srcHeight, if the device orientation is 90 or 270.
+        if(ctx->deviceOrientation & 0x1) {
+            swap(srcWidth, srcHeight);
+        }
+        // Get Aspect Ratio for external
+        getAspectRatioPosition(dstWidth, dstHeight, srcWidth,
+                            srcHeight, outRect);
+    }
+    ALOGD_IF(HWC_UTILS_DEBUG, "%s: view frame for dpy %d is [%d %d %d %d]",
+        __FUNCTION__, dpy, outRect.left, outRect.top,
+        outRect.right, outRect.bottom);
+    return outRect;
+}
+
 void setListStats(hwc_context_t *ctx,
         hwc_display_contents_1_t *list, int dpy) {
     const int prevYuvCount = ctx->listStats[dpy].yuvCount;
@@ -761,13 +766,14 @@ void setListStats(hwc_context_t *ctx,
     trimList(ctx, list, dpy);
     optimizeLayerRects(ctx, list, dpy);
 
+    // Calculate view frame of ext display from primary resolution
+    // and primary device orientation.
+    ctx->mViewFrame[dpy] = calculateDisplayViewFrame(ctx, dpy);
+
     for (size_t i = 0; i < (size_t)ctx->listStats[dpy].numAppLayers; i++) {
         hwc_layer_1_t const* layer = &list->hwLayers[i];
         private_handle_t *hnd = (private_handle_t *)layer->handle;
 
-        // Calculate view frame of each display from the layer displayframe
-        ctx->mViewFrame[dpy] = getUnion(ctx->mViewFrame[dpy],
-                                        layer->displayFrame);
 #ifdef QCOM_BSP
         if (layer->flags & HWC_SCREENSHOT_ANIMATOR_LAYER) {
             ctx->listStats[dpy].isDisplayAnimating = true;
@@ -918,8 +924,14 @@ bool isSecureModePolicy(int mdpVersion) {
 bool isActionSafePresent(hwc_context_t *ctx, int dpy) {
     // if external supports underscan, do nothing
     // it will be taken care in the driver
-    if(!dpy || ctx->mExtDisplay->isCEUnderscanSupported())
+    // Disable Action safe for 8974 due to HW limitation for downscaling
+    // layers with overlapped region
+    // Disable Actionsafe for non HDMI displays.
+    if(!(dpy == HWC_DISPLAY_EXTERNAL) ||
+        qdutils::MDPVersion::getInstance().is8x74v2() ||
+        ctx->mExtDisplay->isCEUnderscanSupported()) {
         return false;
+    }
 
     char value[PROPERTY_VALUE_MAX];
     // Read action safe properties
@@ -996,10 +1008,10 @@ void calculate_crop_rects(hwc_rect_t& crop, hwc_rect_t& dst,
     }
 
     calc_cut(leftCutRatio, topCutRatio, rightCutRatio, bottomCutRatio, orient);
-    crop_l += crop_w * leftCutRatio;
-    crop_t += crop_h * topCutRatio;
-    crop_r -= crop_w * rightCutRatio;
-    crop_b -= crop_h * bottomCutRatio;
+    crop_l += (int)round((double)crop_w * leftCutRatio);
+    crop_t += (int)round((double)crop_h * topCutRatio);
+    crop_r -= (int)round((double)crop_w * rightCutRatio);
+    crop_b -= (int)round((double)crop_h * bottomCutRatio);
 }
 
 bool areLayersIntersecting(const hwc_layer_1_t* layer1,
@@ -1093,7 +1105,8 @@ void optimizeLayerRects(hwc_context_t *ctx,
                if(!needsScaling(&list->hwLayers[j])) {
                   hwc_layer_1_t* layer = (hwc_layer_1_t*)&list->hwLayers[j];
                   hwc_rect_t& bottomframe = layer->displayFrame;
-                  hwc_rect_t& bottomCrop = layer->sourceCrop;
+                  hwc_rect_t bottomCrop =
+                      integerizeSourceCrop(layer->sourceCropf);
                   int transform =layer->transform;
 
                   hwc_rect_t irect = getIntersection(bottomframe, topframe);
@@ -1103,7 +1116,11 @@ void optimizeLayerRects(hwc_context_t *ctx,
                      dest_rect  = deductRect(bottomframe, irect);
                      qhwc::calculate_crop_rects(bottomCrop, bottomframe,
                                                 dest_rect, transform);
-
+                     //Update layer sourceCropf
+                     layer->sourceCropf.left = bottomCrop.left;
+                     layer->sourceCropf.top = bottomCrop.top;
+                     layer->sourceCropf.right = bottomCrop.right;
+                     layer->sourceCropf.bottom = bottomCrop.bottom;
                   }
                }
                j--;
@@ -1155,6 +1172,7 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     int acquireFd[MAX_NUM_APP_LAYERS];
     int count = 0;
     int releaseFd = -1;
+    int retireFd = -1;
     int fbFd = -1;
     bool swapzero = false;
     int mdpVersion = qdutils::MDPVersion::getInstance().getMDPVersion();
@@ -1163,6 +1181,8 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     memset(&data, 0, sizeof(data));
     data.acq_fen_fd = acquireFd;
     data.rel_fen_fd = &releaseFd;
+    data.retire_fen_fd = &retireFd;
+    data.flags = MDP_BUF_SYNC_FLAG_RETIRE_FENCE;
 
     char property[PROPERTY_VALUE_MAX];
     if(property_get("debug.egl.swapinterval", property, "1") > 0) {
@@ -1201,10 +1221,9 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         }
     }
 
-    //Accumulate acquireFenceFds for MDP
+    //Accumulate acquireFenceFds for MDP Overlays
     for(uint32_t i = 0; i < list->numHwLayers; i++) {
-        if((list->hwLayers[i].compositionType == HWC_OVERLAY  ||
-                        list->hwLayers[i].compositionType == HWC_BLIT) &&
+        if(list->hwLayers[i].compositionType == HWC_OVERLAY &&
                         list->hwLayers[i].acquireFenceFd >= 0) {
             if(UNLIKELY(swapzero))
                 acquireFd[count++] = -1;
@@ -1257,7 +1276,13 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
                 list->hwLayers[i].releaseFenceFd = -1;
             } else if(list->hwLayers[i].releaseFenceFd < 0) {
                 //If rotator has not already populated this field.
-                list->hwLayers[i].releaseFenceFd = dup(releaseFd);
+                if(list->hwLayers[i].compositionType == HWC_BLIT) {
+                    //For Blit, the app layers should be released when the Blit is
+                    //complete. This fd was passed from copybit->draw
+                    list->hwLayers[i].releaseFenceFd = dup(fd);
+                } else {
+                    list->hwLayers[i].releaseFenceFd = dup(releaseFd);
+                }
             }
         }
     }
@@ -1272,20 +1297,14 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
 
     //Signals when MDP finishes reading rotator buffers.
     ctx->mLayerRotMap[dpy]->setReleaseFd(releaseFd);
+    close(releaseFd);
+    releaseFd = -1;
 
-    // if external is animating, close the relaseFd
-    if(isExtAnimating) {
-        close(releaseFd);
-        releaseFd = -1;
-    }
-
-    if(UNLIKELY(swapzero)){
+    if(UNLIKELY(swapzero)) {
         list->retireFenceFd = -1;
-        close(releaseFd);
     } else {
-        list->retireFenceFd = releaseFd;
+        list->retireFenceFd = retireFd;
     }
-
     return ret;
 }
 
@@ -1610,6 +1629,10 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             whf.format = getMdpFormat(HAL_PIXEL_FORMAT_BGRX_8888);
     }
 
+    /* Calculate the external display position based on MDP downscale,
+       ActionSafe, and extorientation features. */
+    calcExtDisplayPosition(ctx, hnd, dpy, crop, dst, transform, orient);
+
     setMdpFlags(layer, mdpFlagsL, 0, transform);
 
     if(lDest != OV_INVALID && rDest != OV_INVALID) {
@@ -1747,6 +1770,10 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
     Whf whf(getWidth(hnd), getHeight(hnd),
             getMdpFormat(hnd->format), hnd->size);
 
+    /* Calculate the external display position based on MDP downscale,
+       ActionSafe, and extorientation features. */
+    calcExtDisplayPosition(ctx, hnd, dpy, crop, dst, transform, orient);
+
     setMdpFlags(layer, mdpFlagsL, 0, transform);
     trimLayer(ctx, dpy, transform, crop, dst);
 
@@ -1843,7 +1870,7 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
 bool canUseRotator(hwc_context_t *ctx, int dpy) {
     if(qdutils::MDPVersion::getInstance().is8x26() &&
-            ctx->mVirtualDisplay->isConnected() &&
+            isSecondaryConnected(ctx) &&
             !ctx->dpyAttr[HWC_DISPLAY_VIRTUAL].isPause) {
         /* 8x26 mdss driver supports multiplexing of DMA pipe
          * in LINE and BLOCK modes for writeback panels.

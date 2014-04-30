@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2013, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2014, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -27,28 +27,20 @@
  * IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-#ifndef _QD_UTIL_MISC_H
-#define _QD_UTIL_MISC_H
+#include "cb_swap_rect.h"
 
-#include <utils/threads.h>
-#include <linux/fb.h>
-#include <ctype.h>
-#include <fcntl.h>
-#include <utils/Errors.h>
-#include <utils/Log.h>
+ANDROID_SINGLETON_STATIC_INSTANCE(qdutils::cb_swap_rect);
 
-#include <linux/fb.h>
-#include <sys/ioctl.h>
-#include <sys/poll.h>
-#include <sys/resource.h>
-#include <cutils/properties.h>
-#include <hardware/hwcomposer.h>
+namespace qdutils {
 
-#define EDID_RAW_DATA_SIZE 640
+cb_swap_rect:: cb_swap_rect(){
+     swap_rect_feature_on = false ;
+}
+void cb_swap_rect::setSwapRectFeature_on( bool value){
+       swap_rect_feature_on = value ;
+}
+bool cb_swap_rect::checkSwapRectFeature_on(){
+       return swap_rect_feature_on;
+}
 
-int getEdidRawData(char *buffer);
-
-void getAspectRatioPosition(int destWidth, int destHeight, int srcWidth,
-                                int srcHeight, hwc_rect_t& rect);
-
-#endif
+};

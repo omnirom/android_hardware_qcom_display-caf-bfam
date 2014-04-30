@@ -152,7 +152,7 @@ static int hwc_prepare_primary(hwc_composer_device_1 *dev,
 #endif
         if(ctx->mMDPComp[dpy]->prepare(ctx, list) < 0) {
             const int fbZ = 0;
-            ctx->mFBUpdate[dpy]->prepare(ctx, list, fbZ);
+            ctx->mFBUpdate[dpy]->prepareAndValidate(ctx, list, fbZ);
         }
         if (ctx->mMDP.version < qdutils::MDP_V4_0) {
             if(ctx->mCopyBit[dpy])
@@ -177,7 +177,7 @@ static int hwc_prepare_external(hwc_composer_device_1 *dev,
             setListStats(ctx, list, dpy);
             if(ctx->mMDPComp[dpy]->prepare(ctx, list) < 0) {
                 const int fbZ = 0;
-                ctx->mFBUpdate[dpy]->prepare(ctx, list, fbZ);
+                ctx->mFBUpdate[dpy]->prepareAndValidate(ctx, list, fbZ);
             }
         } else {
             /* External Display is in Pause state.
@@ -209,7 +209,7 @@ static int hwc_prepare_virtual(hwc_composer_device_1 *dev,
             setListStats(ctx, list, dpy);
             if(ctx->mMDPComp[dpy]->prepare(ctx, list) < 0) {
                 const int fbZ = 0;
-                ctx->mFBUpdate[dpy]->prepare(ctx, list, fbZ);
+                ctx->mFBUpdate[dpy]->prepareAndValidate(ctx, list, fbZ);
             }
         } else {
             /* Virtual Display is in Pause state.
@@ -405,8 +405,11 @@ static void reset_panel(struct hwc_composer_device_1* dev)
     int ret = 0;
     hwc_context_t* ctx = (hwc_context_t*)(dev);
 
-    if (!ctx->mPanelResetStatus)
+    if (!ctx->dpyAttr[HWC_DISPLAY_PRIMARY].isActive) {
+        ALOGD ("%s : Display OFF - Skip BLANK & UNBLANK", __FUNCTION__);
+        ctx->mPanelResetStatus = false;
         return;
+    }
 
     ALOGD("%s: calling BLANK DISPLAY", __FUNCTION__);
     ret = hwc_blank(dev, HWC_DISPLAY_PRIMARY, 1);
