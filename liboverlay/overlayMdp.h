@@ -80,8 +80,12 @@ public:
     utils::Dim getDstRectDim() const;
     /* returns a copy to src rect dim */
     utils::Dim getSrcRectDim() const;
+    /* return pipe priority */
+    uint8_t getPriority() const;
     /* setVisualParam */
     bool setVisualParams(const MetaData_t& data);
+    /* sets pipe type RGB/DMA/VG */
+    void setPipeType(const utils::eMdpPipeType& pType);
 
     static bool validateAndSet(MdpCtrl* mdpCtrlArray[], const int& count,
             const int& fbFd);
@@ -302,6 +306,14 @@ inline void MdpCtrl::setRotationFlags() {
     const int u = getUserData();
     if (u & MDP_ROT_90)
         mOVInfo.flags |= MDP_SOURCE_ROTATED_90;
+}
+
+inline uint8_t MdpCtrl::getPriority() const {
+#if 0 // only supported in 3.10
+    return mOVInfo.priority;
+#else
+    return 0;
+#endif
 }
 
 ///////    MdpCtrl3D //////

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2012-2013, The Linux Foundation. All rights reserved.
+ * Copyright (C) 2012-2014, The Linux Foundation. All rights reserved.
  * Not a Contribution, Apache license notifications and license are retained
  * for attribution purposes only.
  *
@@ -26,6 +26,7 @@
 #include "hwc_fbupdate.h"
 #include "hwc_ad.h"
 #include <overlayRotator.h>
+#include "hwc_copybit.h"
 
 using namespace overlay;
 using namespace qdutils;
@@ -42,12 +43,14 @@ bool MDPComp::sHandleTimeout = false;
 bool MDPComp::sDebugLogs = false;
 bool MDPComp::sEnabled = false;
 bool MDPComp::sEnableMixedMode = true;
-bool MDPComp::sEnablePartialFrameUpdate = false;
 int MDPComp::sMaxPipesPerMixer = MAX_PIPES_PER_MIXER;
 bool MDPComp::sEnable4k2kYUVSplit = false;
-
+bool MDPComp::sSrcSplitEnabled = false;
 MDPComp* MDPComp::getObject(hwc_context_t *ctx, const int& dpy) {
-    if(isDisplaySplit(ctx, dpy)) {
+    if(qdutils::MDPVersion::getInstance().isSrcSplit()) {
+        sSrcSplitEnabled = true;
+        return new MDPCompSrcSplit(dpy);
+    } else if(isDisplaySplit(ctx, dpy)) {
         return new MDPCompSplit(dpy);
     }
     return new MDPCompNonSplit(dpy);
@@ -113,14 +116,6 @@ bool MDPComp::init(hwc_context_t *ctx) {
             sDebugLogs = true;
     }
 
-    if(property_get("persist.hwc.partialupdate", property, NULL) > 0) {
-        if((atoi(property) != 0) && ctx->mMDP.panel == MIPI_CMD_PANEL &&
-           qdutils::MDPVersion::getInstance().is8x74v2())
-            sEnablePartialFrameUpdate = true;
-    }
-    ALOGE_IF(isDebug(), "%s: Partial Update applicable?: %d",__FUNCTION__,
-                                                    sEnablePartialFrameUpdate);
-
     sMaxPipesPerMixer = MAX_PIPES_PER_MIXER;
     if(property_get("debug.mdpcomp.maxpermixer", property, "-1") > 0) {
         int val = atoi(property);
@@ -144,7 +139,8 @@ bool MDPComp::init(hwc_context_t *ctx) {
             ALOGE("%s: failed to instantiate idleInvalidator object",
                   __FUNCTION__);
         } else {
-            idleInvalidator->init(timeout_handler, ctx, idle_timeout);
+            idleInvalidator->init(timeout_handler, ctx,
+                                  (unsigned int)idle_timeout);
         }
     }
 
@@ -153,6 +149,14 @@ bool MDPComp::init(hwc_context_t *ctx) {
              (!strncasecmp(property,"true", PROPERTY_VALUE_MAX )))) {
         sEnable4k2kYUVSplit = true;
     }
+
+    if ((property_get("persist.hwc.ptor.enable", property, NULL) > 0) &&
+            ((!strncasecmp(property, "true", PROPERTY_VALUE_MAX )) ||
+             (!strncmp(property, "1", PROPERTY_VALUE_MAX )))) {
+        ctx->mCopyBit[HWC_DISPLAY_PRIMARY] = new CopyBit(ctx,
+                                                    HWC_DISPLAY_PRIMARY);
+    }
+
     return true;
 }
 
@@ -161,6 +165,11 @@ void MDPComp::reset(hwc_context_t *ctx) {
     mCurrentFrame.reset(numLayers);
     ctx->mOverlay->clear(mDpy);
     ctx->mLayerRotMap[mDpy]->clear();
+}
+
+void MDPComp::reset() {
+    sHandleTimeout = false;
+    mModeOn = false;
 }
 
 void MDPComp::timeout_handler(void *udata) {
@@ -263,7 +272,7 @@ void MDPComp::LayerCache::reset() {
 }
 
 void MDPComp::LayerCache::cacheAll(hwc_display_contents_1_t* list) {
-    const int numAppLayers = list->numHwLayers - 1;
+    const int numAppLayers = (int)list->numHwLayers - 1;
     for(int i = 0; i < numAppLayers; i++) {
         hnd[i] = list->hwLayers[i].handle;
     }
@@ -304,7 +313,6 @@ bool MDPComp::isSupportedForMDPComp(hwc_context_t *ctx, hwc_layer_1_t* layer) {
 }
 
 bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
-    const int dpy = HWC_DISPLAY_PRIMARY;
     private_handle_t *hnd = (private_handle_t *)layer->handle;
 
     if(!hnd) {
@@ -320,17 +328,15 @@ bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
     if(!isSecureBuffer(hnd) && isNonIntegralSourceCrop(layer->sourceCropf))
         return false;
 
-    int hw_w = ctx->dpyAttr[mDpy].xres;
-    int hw_h = ctx->dpyAttr[mDpy].yres;
-
     hwc_rect_t crop = integerizeSourceCrop(layer->sourceCropf);
     hwc_rect_t dst = layer->displayFrame;
-    int crop_w = crop.right - crop.left;
-    int crop_h = crop.bottom - crop.top;
+    bool rotated90 = (bool)layer->transform & HAL_TRANSFORM_ROT_90;
+    int crop_w = rotated90 ? crop.bottom - crop.top : crop.right - crop.left;
+    int crop_h = rotated90 ? crop.right - crop.left : crop.bottom - crop.top;
     int dst_w = dst.right - dst.left;
     int dst_h = dst.bottom - dst.top;
-    float w_dscale = ceilf((float)crop_w / (float)dst_w);
-    float h_dscale = ceilf((float)crop_h / (float)dst_h);
+    float w_scale = ((float)crop_w / (float)dst_w);
+    float h_scale = ((float)crop_h / (float)dst_h);
 
     /* Workaround for MDP HW limitation in DSI command mode panels where
      * FPS will not go beyond 30 if buffers on RGB pipes are of width or height
@@ -341,105 +347,97 @@ bool MDPComp::isValidDimension(hwc_context_t *ctx, hwc_layer_1_t *layer) {
     if((crop_w < 5)||(crop_h < 5))
         return false;
 
-    if((w_dscale > 1.0f) || (h_dscale > 1.0f)) {
-        const uint32_t downscale =
+    if((w_scale > 1.0f) || (h_scale > 1.0f)) {
+        const uint32_t maxMDPDownscale =
             qdutils::MDPVersion::getInstance().getMaxMDPDownscale();
+        const float w_dscale = w_scale;
+        const float h_dscale = h_scale;
+
         if(ctx->mMDP.version >= qdutils::MDSS_V5) {
-            /* Workaround for downscales larger than 4x.
-             * Will be removed once decimator block is enabled for MDSS
-             */
+
             if(!qdutils::MDPVersion::getInstance().supportsDecimation()) {
-                if(crop_w > MAX_DISPLAY_DIM || w_dscale > downscale ||
-                   h_dscale > downscale)
+                /* On targets that doesnt support Decimation (eg.,8x26)
+                 * maximum downscale support is overlay pipe downscale.
+                 */
+                if(crop_w > MAX_DISPLAY_DIM || w_dscale > maxMDPDownscale ||
+                        h_dscale > maxMDPDownscale)
                     return false;
             } else {
-                if(w_dscale > 64 || h_dscale > 64)
+                // Decimation on macrotile format layers is not supported.
+                if(isTileRendered(hnd)) {
+                    /* MDP can read maximum MAX_DISPLAY_DIM width.
+                     * Bail out if
+                     *      1. Src crop > MAX_DISPLAY_DIM on nonsplit MDPComp
+                     *      2. exceeds maximum downscale limit
+                     */
+                    if(((crop_w > MAX_DISPLAY_DIM) && !sSrcSplitEnabled) ||
+                            w_dscale > maxMDPDownscale ||
+                            h_dscale > maxMDPDownscale) {
+                        return false;
+                    }
+                } else if(w_dscale > 64 || h_dscale > 64)
                     return false;
             }
         } else { //A-family
-            if(w_dscale > downscale || h_dscale > downscale)
+            if(w_dscale > maxMDPDownscale || h_dscale > maxMDPDownscale)
                 return false;
         }
+    }
+
+    if((w_scale < 1.0f) || (h_scale < 1.0f)) {
+        const uint32_t upscale =
+            qdutils::MDPVersion::getInstance().getMaxMDPUpscale();
+        const float w_uscale = 1.0f / w_scale;
+        const float h_uscale = 1.0f / h_scale;
+
+        if(w_uscale > upscale || h_uscale > upscale)
+            return false;
     }
 
     return true;
 }
 
-ovutils::eDest MDPComp::getMdpPipe(hwc_context_t *ctx, ePipeType type,
-        int mixer) {
-    overlay::Overlay& ov = *ctx->mOverlay;
-    ovutils::eDest mdp_pipe = ovutils::OV_INVALID;
-
-    switch(type) {
-    case MDPCOMP_OV_DMA:
-        mdp_pipe = ov.nextPipe(ovutils::OV_MDP_PIPE_DMA, mDpy, mixer);
-        if(mdp_pipe != ovutils::OV_INVALID) {
-            return mdp_pipe;
-        }
-    case MDPCOMP_OV_ANY:
-    case MDPCOMP_OV_RGB:
-        mdp_pipe = ov.nextPipe(ovutils::OV_MDP_PIPE_RGB, mDpy, mixer);
-        if(mdp_pipe != ovutils::OV_INVALID) {
-            return mdp_pipe;
-        }
-
-        if(type == MDPCOMP_OV_RGB) {
-            //Requested only for RGB pipe
-            break;
-        }
-    case  MDPCOMP_OV_VG:
-        return ov.nextPipe(ovutils::OV_MDP_PIPE_VG, mDpy, mixer);
-    default:
-        ALOGE("%s: Invalid pipe type",__FUNCTION__);
-        return ovutils::OV_INVALID;
-    };
-    return ovutils::OV_INVALID;
-}
-
 bool MDPComp::isFrameDoable(hwc_context_t *ctx) {
     bool ret = true;
-    const int numAppLayers = ctx->listStats[mDpy].numAppLayers;
 
     if(!isEnabled()) {
         ALOGD_IF(isDebug(),"%s: MDP Comp. not enabled.", __FUNCTION__);
         ret = false;
-    } else if(qdutils::MDPVersion::getInstance().is8x26() &&
+    } else if((qdutils::MDPVersion::getInstance().is8x26() ||
+               qdutils::MDPVersion::getInstance().is8x16()) &&
             ctx->mVideoTransFlag &&
             isSecondaryConnected(ctx)) {
         //1 Padding round to shift pipes across mixers
         ALOGD_IF(isDebug(),"%s: MDP Comp. video transition padding round",
                 __FUNCTION__);
         ret = false;
-    } else if(ctx->dpyAttr[HWC_DISPLAY_EXTERNAL].isConfiguring ||
-              ctx->dpyAttr[HWC_DISPLAY_VIRTUAL].isConfiguring) {
+    } else if(isSecondaryConfiguring(ctx)) {
         ALOGD_IF( isDebug(),"%s: External Display connection is pending",
                   __FUNCTION__);
         ret = false;
     } else if(ctx->isPaddingRound) {
-        ctx->isPaddingRound = false;
-        ALOGD_IF(isDebug(), "%s: padding round",__FUNCTION__);
+        ALOGD_IF(isDebug(), "%s: padding round invoked for dpy %d",
+                 __FUNCTION__,mDpy);
         ret = false;
     }
     return ret;
 }
 
-/*
- * 1) Identify layers that are not visible in the updating ROI and drop them
- * from composition.
- * 2) If we have a scaling layers which needs cropping against generated ROI.
- * Reset ROI to full resolution.
- */
-bool MDPComp::validateAndApplyROI(hwc_context_t *ctx,
-                               hwc_display_contents_1_t* list, hwc_rect_t roi) {
+void MDPCompNonSplit::trimAgainstROI(hwc_context_t *ctx, hwc_rect_t& fbRect) {
+    hwc_rect_t roi = ctx->listStats[mDpy].lRoi;
+    fbRect = getIntersection(fbRect, roi);
+}
+
+/* 1) Identify layers that are not visible or lying outside the updating ROI and
+ *    drop them from composition.
+ * 2) If we have a scaling layer which needs cropping against generated
+ *    ROI, reset ROI to full resolution. */
+bool MDPCompNonSplit::validateAndApplyROI(hwc_context_t *ctx,
+        hwc_display_contents_1_t* list) {
     int numAppLayers = ctx->listStats[mDpy].numAppLayers;
-
-    if(!isValidRect(roi))
-        return false;
-
-    hwc_rect_t visibleRect = roi;
+    hwc_rect_t visibleRect = ctx->listStats[mDpy].lRoi;
 
     for(int i = numAppLayers - 1; i >= 0; i--){
-
         if(!isValidRect(visibleRect)) {
             mCurrentFrame.drop[i] = true;
             mCurrentFrame.dropCount++;
@@ -447,25 +445,16 @@ bool MDPComp::validateAndApplyROI(hwc_context_t *ctx,
         }
 
         const hwc_layer_1_t* layer =  &list->hwLayers[i];
-
         hwc_rect_t dstRect = layer->displayFrame;
-        hwc_rect_t srcRect = integerizeSourceCrop(layer->sourceCropf);
-        int transform = layer->transform;
-
         hwc_rect_t res  = getIntersection(visibleRect, dstRect);
-
-        int res_w = res.right - res.left;
-        int res_h = res.bottom - res.top;
-        int dst_w = dstRect.right - dstRect.left;
-        int dst_h = dstRect.bottom - dstRect.top;
 
         if(!isValidRect(res)) {
             mCurrentFrame.drop[i] = true;
             mCurrentFrame.dropCount++;
-        }else {
+        } else {
             /* Reset frame ROI when any layer which needs scaling also needs ROI
              * cropping */
-            if((res_w != dst_w || res_h != dst_h) && needsScaling (layer)) {
+            if(!isSameRect(res, dstRect) && needsScaling (layer)) {
                 ALOGI("%s: Resetting ROI due to scaling", __FUNCTION__);
                 memset(&mCurrentFrame.drop, 0, sizeof(mCurrentFrame.drop));
                 mCurrentFrame.dropCount = 0;
@@ -480,52 +469,189 @@ bool MDPComp::validateAndApplyROI(hwc_context_t *ctx,
     return true;
 }
 
-void MDPComp::generateROI(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
+/* Calculate ROI for the frame by accounting all the layer's dispalyFrame which
+ * are updating. If DirtyRegion is applicable, calculate it by accounting all
+ * the changing layer's dirtyRegion. */
+void MDPCompNonSplit::generateROI(hwc_context_t *ctx,
+        hwc_display_contents_1_t* list) {
     int numAppLayers = ctx->listStats[mDpy].numAppLayers;
-
-    if(!sEnablePartialFrameUpdate) {
-        return;
-    }
-
-    if(mDpy || isDisplaySplit(ctx, mDpy)){
-        ALOGE_IF(isDebug(), "%s: ROI not supported for"
-                 "the (1) external / virtual display's (2) dual DSI displays",
-                 __FUNCTION__);
-        return;
-    }
-
-    if(isSkipPresent(ctx, mDpy))
-        return;
-
-    if(list->flags & HWC_GEOMETRY_CHANGED)
+    if(!canPartialUpdate(ctx, list))
         return;
 
     struct hwc_rect roi = (struct hwc_rect){0, 0, 0, 0};
-    for(int index = 0; index < numAppLayers; index++ ) {
-        if ((mCachedFrame.hnd[index] != list->hwLayers[index].handle) ||
-            isYuvBuffer((private_handle_t *)list->hwLayers[index].handle)) {
-            hwc_rect_t dstRect = list->hwLayers[index].displayFrame;
-            hwc_rect_t srcRect = integerizeSourceCrop(
-                                        list->hwLayers[index].sourceCropf);
-            int transform = list->hwLayers[index].transform;
+    hwc_rect fullFrame = (struct hwc_rect) {0, 0,(int)ctx->dpyAttr[mDpy].xres,
+        (int)ctx->dpyAttr[mDpy].yres};
 
-            /* Intersect against display boundaries */
-            roi = getUnion(roi, dstRect);
+    for(int index = 0; index < numAppLayers; index++ ) {
+        hwc_layer_1_t* layer = &list->hwLayers[index];
+        if ((mCachedFrame.hnd[index] != layer->handle) ||
+                isYuvBuffer((private_handle_t *)layer->handle)) {
+            hwc_rect_t dst = layer->displayFrame;
+            hwc_rect_t updatingRect = dst;
+
+#ifdef QCOM_BSP
+            if(!needsScaling(layer) && !layer->transform)
+            {
+                hwc_rect_t src = integerizeSourceCrop(layer->sourceCropf);
+                int x_off = dst.left - src.left;
+                int y_off = dst.top - src.top;
+                updatingRect = moveRect(layer->dirtyRect, x_off, y_off);
+            }
+#endif
+
+            roi = getUnion(roi, updatingRect);
         }
     }
 
-    if(!validateAndApplyROI(ctx, list, roi)){
-        roi = (struct hwc_rect) {0, 0,
-                    (int)ctx->dpyAttr[mDpy].xres, (int)ctx->dpyAttr[mDpy].yres};
-    }
+    /* No layer is updating. Still SF wants a refresh.*/
+    if(!isValidRect(roi))
+        return;
 
-    ctx->listStats[mDpy].roi.x = roi.left;
-    ctx->listStats[mDpy].roi.y = roi.top;
-    ctx->listStats[mDpy].roi.w = roi.right - roi.left;
-    ctx->listStats[mDpy].roi.h = roi.bottom - roi.top;
+    // Align ROI coordinates to panel restrictions
+    roi = getSanitizeROI(roi, fullFrame);
+
+    ctx->listStats[mDpy].lRoi = roi;
+    if(!validateAndApplyROI(ctx, list))
+        resetROI(ctx, mDpy);
 
     ALOGD_IF(isDebug(),"%s: generated ROI: [%d, %d, %d, %d]", __FUNCTION__,
-                               roi.left, roi.top, roi.right, roi.bottom);
+            ctx->listStats[mDpy].lRoi.left, ctx->listStats[mDpy].lRoi.top,
+            ctx->listStats[mDpy].lRoi.right, ctx->listStats[mDpy].lRoi.bottom);
+}
+
+void MDPCompSplit::trimAgainstROI(hwc_context_t *ctx, hwc_rect_t& fbRect) {
+    hwc_rect l_roi = ctx->listStats[mDpy].lRoi;
+    hwc_rect r_roi = ctx->listStats[mDpy].rRoi;
+
+    hwc_rect_t l_fbRect = getIntersection(fbRect, l_roi);
+    hwc_rect_t r_fbRect = getIntersection(fbRect, r_roi);
+    fbRect = getUnion(l_fbRect, r_fbRect);
+}
+/* 1) Identify layers that are not visible or lying outside BOTH the updating
+ *    ROI's and drop them from composition. If a layer is spanning across both
+ *    the halves of the screen but needed by only ROI, the non-contributing
+ *    half will not be programmed for MDP.
+ * 2) If we have a scaling layer which needs cropping against generated
+ *    ROI, reset ROI to full resolution. */
+bool MDPCompSplit::validateAndApplyROI(hwc_context_t *ctx,
+        hwc_display_contents_1_t* list) {
+
+    int numAppLayers = ctx->listStats[mDpy].numAppLayers;
+
+    hwc_rect_t visibleRectL = ctx->listStats[mDpy].lRoi;
+    hwc_rect_t visibleRectR = ctx->listStats[mDpy].rRoi;
+
+    for(int i = numAppLayers - 1; i >= 0; i--){
+        if(!isValidRect(visibleRectL) && !isValidRect(visibleRectR))
+        {
+            mCurrentFrame.drop[i] = true;
+            mCurrentFrame.dropCount++;
+            continue;
+        }
+
+        const hwc_layer_1_t* layer =  &list->hwLayers[i];
+        hwc_rect_t dstRect = layer->displayFrame;
+
+        hwc_rect_t l_res  = getIntersection(visibleRectL, dstRect);
+        hwc_rect_t r_res  = getIntersection(visibleRectR, dstRect);
+        hwc_rect_t res = getUnion(l_res, r_res);
+
+        if(!isValidRect(l_res) && !isValidRect(r_res)) {
+            mCurrentFrame.drop[i] = true;
+            mCurrentFrame.dropCount++;
+        } else {
+            /* Reset frame ROI when any layer which needs scaling also needs ROI
+             * cropping */
+            if(!isSameRect(res, dstRect) && needsScaling (layer)) {
+                memset(&mCurrentFrame.drop, 0, sizeof(mCurrentFrame.drop));
+                mCurrentFrame.dropCount = 0;
+                return false;
+            }
+
+            if (layer->blending == HWC_BLENDING_NONE) {
+                visibleRectL = deductRect(visibleRectL, l_res);
+                visibleRectR = deductRect(visibleRectR, r_res);
+            }
+        }
+    }
+    return true;
+}
+/* Calculate ROI for the frame by accounting all the layer's dispalyFrame which
+ * are updating. If DirtyRegion is applicable, calculate it by accounting all
+ * the changing layer's dirtyRegion. */
+void MDPCompSplit::generateROI(hwc_context_t *ctx,
+        hwc_display_contents_1_t* list) {
+    if(!canPartialUpdate(ctx, list))
+        return;
+
+    int numAppLayers = ctx->listStats[mDpy].numAppLayers;
+    int lSplit = getLeftSplit(ctx, mDpy);
+
+    int hw_h = (int)ctx->dpyAttr[mDpy].yres;
+    int hw_w = (int)ctx->dpyAttr[mDpy].xres;
+
+    struct hwc_rect l_frame = (struct hwc_rect){0, 0, lSplit, hw_h};
+    struct hwc_rect r_frame = (struct hwc_rect){lSplit, 0, hw_w, hw_h};
+
+    struct hwc_rect l_roi = (struct hwc_rect){0, 0, 0, 0};
+    struct hwc_rect r_roi = (struct hwc_rect){0, 0, 0, 0};
+
+    for(int index = 0; index < numAppLayers; index++ ) {
+        hwc_layer_1_t* layer = &list->hwLayers[index];
+        if ((mCachedFrame.hnd[index] != layer->handle) ||
+                isYuvBuffer((private_handle_t *)layer->handle)) {
+            hwc_rect_t dst = layer->displayFrame;
+            hwc_rect_t updatingRect = dst;
+
+#ifdef QCOM_BSP
+            if(!needsScaling(layer) && !layer->transform)
+            {
+                hwc_rect_t src = integerizeSourceCrop(layer->sourceCropf);
+                int x_off = dst.left - src.left;
+                int y_off = dst.top - src.top;
+                updatingRect = moveRect(layer->dirtyRect, x_off, y_off);
+            }
+#endif
+
+            hwc_rect_t l_dst  = getIntersection(l_frame, updatingRect);
+            if(isValidRect(l_dst))
+                l_roi = getUnion(l_roi, l_dst);
+
+            hwc_rect_t r_dst  = getIntersection(r_frame, updatingRect);
+            if(isValidRect(r_dst))
+                r_roi = getUnion(r_roi, r_dst);
+        }
+    }
+
+    /* For panels that cannot accept commands in both the interfaces, we cannot
+     * send two ROI's (for each half). We merge them into single ROI and split
+     * them across lSplit for MDP mixer use. The ROI's will be merged again
+     * finally before udpating the panel in the driver. */
+    if(qdutils::MDPVersion::getInstance().needsROIMerge()) {
+        hwc_rect_t temp_roi = getUnion(l_roi, r_roi);
+        l_roi = getIntersection(temp_roi, l_frame);
+        r_roi = getIntersection(temp_roi, r_frame);
+    }
+
+    /* No layer is updating. Still SF wants a refresh. */
+    if(!isValidRect(l_roi) && !isValidRect(r_roi))
+        return;
+
+    l_roi = getSanitizeROI(l_roi, l_frame);
+    r_roi = getSanitizeROI(r_roi, r_frame);
+
+    ctx->listStats[mDpy].lRoi = l_roi;
+    ctx->listStats[mDpy].rRoi = r_roi;
+
+    if(!validateAndApplyROI(ctx, list))
+        resetROI(ctx, mDpy);
+
+    ALOGD_IF(isDebug(),"%s: generated L_ROI: [%d, %d, %d, %d]"
+            "R_ROI: [%d, %d, %d, %d]", __FUNCTION__,
+            ctx->listStats[mDpy].lRoi.left, ctx->listStats[mDpy].lRoi.top,
+            ctx->listStats[mDpy].lRoi.right, ctx->listStats[mDpy].lRoi.bottom,
+            ctx->listStats[mDpy].rRoi.left, ctx->listStats[mDpy].rRoi.top,
+            ctx->listStats[mDpy].rRoi.right, ctx->listStats[mDpy].rRoi.bottom);
 }
 
 /* Checks for conditions where all the layers marked for MDP comp cannot be
@@ -534,6 +660,7 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
                                 hwc_display_contents_1_t* list){
 
     const int numAppLayers = ctx->listStats[mDpy].numAppLayers;
+    int priDispW = ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres;
 
     if(sIdleFallBack && !ctx->listStats[mDpy].secureUI) {
         ALOGD_IF(isDebug(), "%s: Idle fallback dpy %d",__FUNCTION__, mDpy);
@@ -544,6 +671,17 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
         ALOGD_IF(isDebug(),"%s: SKIP present: %d",
                 __FUNCTION__,
                 isSkipPresent(ctx, mDpy));
+        return false;
+    }
+
+    if(mDpy > HWC_DISPLAY_PRIMARY && (priDispW > MAX_DISPLAY_DIM) &&
+                              (ctx->dpyAttr[mDpy].xres < MAX_DISPLAY_DIM)) {
+        // Disable MDP comp on Secondary when the primary is highres panel and
+        // the secondary is a normal 1080p, because, MDP comp on secondary under
+        // in such usecase, decimation gets used for downscale and there will be
+        // a quality mismatch when there will be a fallback to GPU comp
+        ALOGD_IF(isDebug(), "%s: Disable MDP Compositon for Secondary Disp",
+              __FUNCTION__);
         return false;
     }
 
@@ -568,9 +706,10 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
 
         //For 8x26 with panel width>1k, if RGB layer needs HFLIP fail mdp comp
         // may not need it if Gfx pre-rotation can handle all flips & rotations
+        int transform = (layer->flags & HWC_COLOR_FILL) ? 0 : layer->transform;
         if(qdutils::MDPVersion::getInstance().is8x26() &&
                                 (ctx->dpyAttr[mDpy].xres > 1024) &&
-                                (layer->transform & HWC_TRANSFORM_FLIP_H) &&
+                                (transform & HWC_TRANSFORM_FLIP_H) &&
                                 (!isYuvBuffer(hnd)))
                    return false;
     }
@@ -582,6 +721,8 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
     //If all above hard conditions are met we can do full or partial MDP comp.
     bool ret = false;
     if(fullMDPComp(ctx, list)) {
+        ret = true;
+    } else if(fullMDPCompWithPTOR(ctx, list)) {
         ret = true;
     } else if(partialMDPComp(ctx, list)) {
         ret = true;
@@ -601,19 +742,11 @@ bool MDPComp::fullMDPComp(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     const int numAppLayers = ctx->listStats[mDpy].numAppLayers;
     for(int i = 0; i < numAppLayers; i++) {
         hwc_layer_1_t* layer = &list->hwLayers[i];
-        if(not isSupportedForMDPComp(ctx, layer)) {
+        if(not mCurrentFrame.drop[i] and
+           not isSupportedForMDPComp(ctx, layer)) {
             ALOGD_IF(isDebug(), "%s: Unsupported layer in list",__FUNCTION__);
             return false;
         }
-
-        //For 8x26, if there is only one layer which needs scale for secondary
-        //while no scale for primary display, DMA pipe is occupied by primary.
-        //If need to fall back to GLES composition, virtual display lacks DMA
-        //pipe and error is reported.
-        if(qdutils::MDPVersion::getInstance().is8x26() &&
-                                mDpy >= HWC_DISPLAY_EXTERNAL &&
-                                qhwc::needsScaling(layer))
-            return false;
     }
 
     mCurrentFrame.fbCount = 0;
@@ -633,6 +766,177 @@ bool MDPComp::fullMDPComp(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     }
 
     return true;
+}
+
+/* Full MDP Composition with Peripheral Tiny Overlap Removal.
+ * MDP bandwidth limitations can be avoided, if the overlap region
+ * covered by the smallest layer at a higher z-order, gets composed
+ * by Copybit on a render buffer, which can be queued to MDP.
+ */
+bool MDPComp::fullMDPCompWithPTOR(hwc_context_t *ctx,
+    hwc_display_contents_1_t* list) {
+
+    const int numAppLayers = ctx->listStats[mDpy].numAppLayers;
+    const int stagesForMDP = min(sMaxPipesPerMixer,
+            ctx->mOverlay->availablePipes(mDpy, Overlay::MIXER_DEFAULT));
+
+    // Hard checks where we cannot use this mode
+    if (mDpy || !ctx->mCopyBit[mDpy] || isDisplaySplit(ctx, mDpy)) {
+        ALOGD_IF(isDebug(), "%s: Feature not supported!", __FUNCTION__);
+        return false;
+    }
+
+    // Frame level checks
+    if ((numAppLayers > stagesForMDP) || isSkipPresent(ctx, mDpy) ||
+        isYuvPresent(ctx, mDpy) || mCurrentFrame.dropCount ||
+        isSecurePresent(ctx, mDpy)) {
+        ALOGD_IF(isDebug(), "%s: Frame not supported!", __FUNCTION__);
+        return false;
+    }
+    // MDP comp checks
+    for(int i = 0; i < numAppLayers; i++) {
+        hwc_layer_1_t* layer = &list->hwLayers[i];
+        if(not isSupportedForMDPComp(ctx, layer)) {
+            ALOGD_IF(isDebug(), "%s: Unsupported layer in list",__FUNCTION__);
+            return false;
+        }
+    }
+
+    /* We cannot use this composition mode, if:
+     1. A below layer needs scaling.
+     2. Overlap is not peripheral to display.
+     3. Overlap or a below layer has 90 degree transform.
+     4. Overlap area > (1/3 * FrameBuffer) area, based on Perf inputs.
+     */
+
+    int minLayerIndex[MAX_PTOR_LAYERS] = { -1, -1};
+    hwc_rect_t overlapRect[MAX_PTOR_LAYERS];
+    memset(overlapRect, 0, sizeof(overlapRect));
+    int layerPixelCount, minPixelCount = 0;
+    int numPTORLayersFound = 0;
+    for (int i = numAppLayers-1; (i >= 0 &&
+                                  numPTORLayersFound < MAX_PTOR_LAYERS); i--) {
+        hwc_layer_1_t* layer = &list->hwLayers[i];
+        hwc_rect_t crop = integerizeSourceCrop(layer->sourceCropf);
+        hwc_rect_t dispFrame = layer->displayFrame;
+        layerPixelCount = (crop.right - crop.left) * (crop.bottom - crop.top);
+        // PTOR layer should be peripheral and cannot have transform
+        if (!isPeripheral(dispFrame, ctx->mViewFrame[mDpy]) ||
+                                has90Transform(layer)) {
+            continue;
+        }
+        if((3 * (layerPixelCount + minPixelCount)) >
+                ((int)ctx->dpyAttr[mDpy].xres * (int)ctx->dpyAttr[mDpy].yres)) {
+            // Overlap area > (1/3 * FrameBuffer) area, based on Perf inputs.
+            continue;
+        }
+        // Found the PTOR layer
+        bool found = true;
+        for (int j = i-1; j >= 0; j--) {
+            // Check if the layers below this layer qualifies for PTOR comp
+            hwc_layer_1_t* layer = &list->hwLayers[j];
+            hwc_rect_t disFrame = layer->displayFrame;
+            //layer below PTOR is intersecting and has 90 degree transform or
+            // needs scaling cannot be supported.
+            if ((isValidRect(getIntersection(dispFrame, disFrame)))
+                            && (has90Transform(layer) || needsScaling(layer))) {
+                found = false;
+                break;
+            }
+        }
+        // Store the minLayer Index
+        if(found) {
+            minLayerIndex[numPTORLayersFound] = i;
+            overlapRect[numPTORLayersFound] = list->hwLayers[i].displayFrame;
+            minPixelCount += layerPixelCount;
+            numPTORLayersFound++;
+        }
+    }
+
+    if(isValidRect(getIntersection(overlapRect[0], overlapRect[1]))) {
+        ALOGD_IF(isDebug(), "%s: Ignore Rect2 its intersects with Rect1",
+                 __FUNCTION__);
+        // reset second minLayerIndex[1];
+        minLayerIndex[1] = -1;
+        numPTORLayersFound--;
+    }
+
+    // No overlap layers
+    if (!numPTORLayersFound)
+        return false;
+
+    ctx->mPtorInfo.count = numPTORLayersFound;
+    for(int i = 0; i < MAX_PTOR_LAYERS; i++) {
+        ctx->mPtorInfo.layerIndex[i] = minLayerIndex[i];
+    }
+
+    if (!ctx->mCopyBit[mDpy]->prepareOverlap(ctx, list)) {
+        // reset PTOR
+        ctx->mPtorInfo.count = 0;
+        return false;
+    }
+    // Store the displayFrame and the sourceCrops of the layers
+    hwc_rect_t displayFrame[numAppLayers];
+    hwc_rect_t sourceCrop[numAppLayers];
+    for(int i = 0; i < numAppLayers; i++) {
+        hwc_layer_1_t* layer = &list->hwLayers[i];
+        displayFrame[i] = layer->displayFrame;
+        sourceCrop[i] = integerizeSourceCrop(layer->sourceCropf);
+    }
+
+    for(int j = 0; j < numPTORLayersFound; j++) {
+        int index =  ctx->mPtorInfo.layerIndex[j];
+        // Remove overlap from crop & displayFrame of below layers
+        for (int i = 0; i < index && index !=-1; i++) {
+            hwc_layer_1_t* layer = &list->hwLayers[i];
+            if(!isValidRect(getIntersection(layer->displayFrame,
+                                            overlapRect[j])))  {
+                continue;
+            }
+            // Update layer attributes
+            hwc_rect_t srcCrop = integerizeSourceCrop(layer->sourceCropf);
+            hwc_rect_t destRect = deductRect(layer->displayFrame,
+                                             overlapRect[j]);
+            qhwc::calculate_crop_rects(srcCrop, layer->displayFrame, destRect,
+                                       layer->transform);
+            layer->sourceCropf.left = (float)srcCrop.left;
+            layer->sourceCropf.top = (float)srcCrop.top;
+            layer->sourceCropf.right = (float)srcCrop.right;
+            layer->sourceCropf.bottom = (float)srcCrop.bottom;
+        }
+    }
+
+    mCurrentFrame.mdpCount = numAppLayers;
+    mCurrentFrame.fbCount = 0;
+    mCurrentFrame.fbZ = -1;
+
+    for (int j = 0; j < numAppLayers; j++)
+        mCurrentFrame.isFBComposed[j] = false;
+
+    bool result = postHeuristicsHandling(ctx, list);
+
+    // Restore layer attributes
+    for(int i = 0; i < numAppLayers; i++) {
+        hwc_layer_1_t* layer = &list->hwLayers[i];
+        layer->displayFrame = displayFrame[i];
+        layer->sourceCropf.left = (float)sourceCrop[i].left;
+        layer->sourceCropf.top = (float)sourceCrop[i].top;
+        layer->sourceCropf.right = (float)sourceCrop[i].right;
+        layer->sourceCropf.bottom = (float)sourceCrop[i].bottom;
+    }
+
+    if (!result) {
+        // reset PTOR
+        ctx->mPtorInfo.count = 0;
+        reset(ctx);
+    } else {
+        ALOGD_IF(isDebug(), "%s: PTOR Indexes: %d and %d", __FUNCTION__,
+                 ctx->mPtorInfo.layerIndex[0],  ctx->mPtorInfo.layerIndex[1]);
+    }
+
+    ALOGD_IF(isDebug(), "%s: Postheuristics %s!", __FUNCTION__,
+             (result ? "successful" : "failed"));
+    return result;
 }
 
 bool MDPComp::partialMDPComp(hwc_context_t *ctx, hwc_display_contents_1_t* list)
@@ -706,7 +1010,7 @@ bool MDPComp::cacheBasedComp(hwc_context_t *ctx,
 
 bool MDPComp::loadBasedComp(hwc_context_t *ctx,
         hwc_display_contents_1_t* list) {
-    if(not isLoadBasedCompDoable(ctx, list)) {
+    if(not isLoadBasedCompDoable(ctx)) {
         return false;
     }
 
@@ -789,10 +1093,19 @@ bool MDPComp::loadBasedComp(hwc_context_t *ctx,
     return false;
 }
 
-bool MDPComp::isLoadBasedCompDoable(hwc_context_t *ctx,
-        hwc_display_contents_1_t* list) {
+bool MDPComp::isLoadBasedCompDoable(hwc_context_t *ctx) {
     if(mDpy or isSecurePresent(ctx, mDpy) or
             isYuvPresent(ctx, mDpy)) {
+        return false;
+    }
+    return true;
+}
+
+bool MDPComp::canPartialUpdate(hwc_context_t *ctx,
+        hwc_display_contents_1_t* list){
+    if(!qdutils::MDPVersion::getInstance().isPartialUpdateEnabled() ||
+            isSkipPresent(ctx, mDpy) || (list->flags & HWC_GEOMETRY_CHANGED) ||
+            mDpy ) {
         return false;
     }
     return true;
@@ -810,6 +1123,7 @@ bool MDPComp::videoOnlyComp(hwc_context_t *ctx,
     int numAppLayers = ctx->listStats[mDpy].numAppLayers;
 
     mCurrentFrame.reset(numAppLayers);
+    mCurrentFrame.fbCount -= mCurrentFrame.dropCount;
     updateYUV(ctx, list, secureOnly);
     int mdpCount = mCurrentFrame.mdpCount;
 
@@ -1044,7 +1358,6 @@ void MDPComp::updateLayerCache(hwc_context_t* ctx,
     int fbCount = 0;
 
     for(int i = 0; i < numAppLayers; i++) {
-        hwc_layer_1_t* layer = &list->hwLayers[i];
         if (mCachedFrame.hnd[i] == list->hwLayers[i].handle) {
             if(!mCurrentFrame.drop[i])
                 fbCount++;
@@ -1092,11 +1405,27 @@ void MDPComp::updateYUV(hwc_context_t* ctx, hwc_display_contents_1_t* list,
              mCurrentFrame.fbCount);
 }
 
+hwc_rect_t MDPComp::getUpdatingFBRect(hwc_context_t *ctx,
+        hwc_display_contents_1_t* list){
+    hwc_rect_t fbRect = (struct hwc_rect){0, 0, 0, 0};
+
+    /* Update only the region of FB needed for composition */
+    for(int i = 0; i < mCurrentFrame.layerCount; i++ ) {
+        if(mCurrentFrame.isFBComposed[i] && !mCurrentFrame.drop[i]) {
+            hwc_layer_1_t* layer = &list->hwLayers[i];
+            hwc_rect_t dst = layer->displayFrame;
+            fbRect = getUnion(fbRect, dst);
+        }
+    }
+    trimAgainstROI(ctx, fbRect);
+    return fbRect;
+}
+
 bool MDPComp::postHeuristicsHandling(hwc_context_t *ctx,
         hwc_display_contents_1_t* list) {
 
     //Capability checks
-    if(!resourceCheck(ctx, list)) {
+    if(!resourceCheck()) {
         ALOGD_IF(isDebug(), "%s: resource check failed", __FUNCTION__);
         return false;
     }
@@ -1109,7 +1438,9 @@ bool MDPComp::postHeuristicsHandling(hwc_context_t *ctx,
 
     //Configure framebuffer first if applicable
     if(mCurrentFrame.fbZ >= 0) {
-        if(!ctx->mFBUpdate[mDpy]->prepare(ctx, list, mCurrentFrame.fbZ)) {
+        hwc_rect_t fbRect = getUpdatingFBRect(ctx, list);
+        if(!ctx->mFBUpdate[mDpy]->prepare(ctx, list, fbRect, mCurrentFrame.fbZ))
+        {
             ALOGD_IF(isDebug(), "%s configure framebuffer failed",
                     __FUNCTION__);
             return false;
@@ -1168,8 +1499,7 @@ bool MDPComp::postHeuristicsHandling(hwc_context_t *ctx,
     return true;
 }
 
-bool MDPComp::resourceCheck(hwc_context_t *ctx,
-        hwc_display_contents_1_t *list) {
+bool MDPComp::resourceCheck() {
     const bool fbUsed = mCurrentFrame.fbCount;
     if(mCurrentFrame.mdpCount > sMaxPipesPerMixer - fbUsed) {
         ALOGD_IF(isDebug(), "%s: Exceeds MAX_PIPES_PER_MIXER",__FUNCTION__);
@@ -1222,14 +1552,23 @@ bool MDPComp::hwLimitationsCheck(hwc_context_t* ctx,
 
 int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     int ret = 0;
-    const int numLayers = ctx->listStats[mDpy].numAppLayers;
-    MDPVersion& mdpVersion = qdutils::MDPVersion::getInstance();
 
-    //number of app layers exceeds MAX_NUM_APP_LAYERS fall back to GPU
-    //do not cache the information for next draw cycle.
-    if(numLayers > MAX_NUM_APP_LAYERS) {
-        ALOGI("%s: Number of App layers exceeded the limit ",
-        __FUNCTION__);
+    if(!ctx || !list) {
+        ALOGE("%s: Invalid context or list",__FUNCTION__);
+        mCachedFrame.reset();
+        return -1;
+    }
+
+    const int numLayers = ctx->listStats[mDpy].numAppLayers;
+
+    // reset PTOR
+    if(!mDpy)
+        memset(&(ctx->mPtorInfo), 0, sizeof(ctx->mPtorInfo));
+
+    //Do not cache the information for next draw cycle.
+    if(numLayers > MAX_NUM_APP_LAYERS or (!numLayers)) {
+        ALOGI("%s: Unsupported layer count for mdp composition",
+                __FUNCTION__);
         mCachedFrame.reset();
         return -1;
     }
@@ -1259,9 +1598,11 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     if(isFrameDoable(ctx)) {
         generateROI(ctx, list);
 
-        if(tryFullFrame(ctx, list) || tryVideoOnly(ctx, list)) {
+        mModeOn = tryFullFrame(ctx, list) || tryVideoOnly(ctx, list);
+        if(mModeOn) {
             setMDPCompLayerFlags(ctx, list);
         } else {
+            resetROI(ctx, mDpy);
             reset(ctx);
             memset(&mCurrentFrame.drop, 0, sizeof(mCurrentFrame.drop));
             mCurrentFrame.dropCount = 0;
@@ -1286,29 +1627,31 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     return ret;
 }
 
-bool MDPComp::allocSplitVGPipesfor4k2k(hwc_context_t *ctx,
-        hwc_display_contents_1_t* list, int index) {
+bool MDPComp::allocSplitVGPipesfor4k2k(hwc_context_t *ctx, int index) {
 
     bool bRet = true;
-    hwc_layer_1_t* layer = &list->hwLayers[index];
-    private_handle_t *hnd = (private_handle_t *)layer->handle;
     int mdpIndex = mCurrentFrame.layerToMDP[index];
     PipeLayerPair& info = mCurrentFrame.mdpToLayer[mdpIndex];
     info.pipeInfo = new MdpYUVPipeInfo;
     info.rot = NULL;
     MdpYUVPipeInfo& pipe_info = *(MdpYUVPipeInfo*)info.pipeInfo;
-    ePipeType type =  MDPCOMP_OV_VG;
 
     pipe_info.lIndex = ovutils::OV_INVALID;
     pipe_info.rIndex = ovutils::OV_INVALID;
 
-    pipe_info.lIndex = getMdpPipe(ctx, type, Overlay::MIXER_DEFAULT);
+    Overlay::PipeSpecs pipeSpecs;
+    pipeSpecs.formatClass = Overlay::FORMAT_YUV;
+    pipeSpecs.needsScaling = true;
+    pipeSpecs.dpy = mDpy;
+    pipeSpecs.fb = false;
+
+    pipe_info.lIndex = ctx->mOverlay->getPipe(pipeSpecs);
     if(pipe_info.lIndex == ovutils::OV_INVALID){
         bRet = false;
         ALOGD_IF(isDebug(),"%s: allocating first VG pipe failed",
                 __FUNCTION__);
     }
-    pipe_info.rIndex = getMdpPipe(ctx, type, Overlay::MIXER_DEFAULT);
+    pipe_info.rIndex = ctx->mOverlay->getPipe(pipeSpecs);
     if(pipe_info.rIndex == ovutils::OV_INVALID){
         bRet = false;
         ALOGD_IF(isDebug(),"%s: allocating second VG pipe failed",
@@ -1316,10 +1659,21 @@ bool MDPComp::allocSplitVGPipesfor4k2k(hwc_context_t *ctx,
     }
     return bRet;
 }
-//=============MDPCompNonSplit===================================================
+
+int MDPComp::drawOverlap(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
+    int fd = -1;
+    if (ctx->mPtorInfo.isActive()) {
+        fd = ctx->mCopyBit[mDpy]->drawOverlap(ctx, list);
+        if (fd < 0) {
+            ALOGD_IF(isDebug(),"%s: failed", __FUNCTION__);
+        }
+    }
+    return fd;
+}
+//=============MDPCompNonSplit==================================================
 
 void MDPCompNonSplit::adjustForSourceSplit(hwc_context_t *ctx,
-         hwc_display_contents_1_t* list){
+        hwc_display_contents_1_t*) {
     //As we split 4kx2k yuv layer and program to 2 VG pipes
     //(if available) increase mdpcount accordingly
     mCurrentFrame.mdpCount += ctx->listStats[mDpy].yuv4k2kCount;
@@ -1333,7 +1687,7 @@ void MDPCompNonSplit::adjustForSourceSplit(hwc_context_t *ctx,
         for(int index = 0; index < n4k2kYuvCount; index++){
             int n4k2kYuvIndex =
                     ctx->listStats[mDpy].yuv4k2kIndices[index];
-            if(mCurrentFrame.fbZ > n4k2kYuvIndex){
+            if(mCurrentFrame.fbZ >= n4k2kYuvIndex){
                 mCurrentFrame.fbZ += 1;
             }
         }
@@ -1368,7 +1722,7 @@ bool MDPCompNonSplit::allocLayerPipes(hwc_context_t *ctx,
         hwc_layer_1_t* layer = &list->hwLayers[index];
         private_handle_t *hnd = (private_handle_t *)layer->handle;
         if(is4kx2kYuvBuffer(hnd) && sEnable4k2kYUVSplit){
-            if(allocSplitVGPipesfor4k2k(ctx, list, index)){
+            if(allocSplitVGPipesfor4k2k(ctx, index)){
                 continue;
             }
         }
@@ -1378,24 +1732,21 @@ bool MDPCompNonSplit::allocLayerPipes(hwc_context_t *ctx,
         info.pipeInfo = new MdpPipeInfoNonSplit;
         info.rot = NULL;
         MdpPipeInfoNonSplit& pipe_info = *(MdpPipeInfoNonSplit*)info.pipeInfo;
-        ePipeType type = MDPCOMP_OV_ANY;
 
-        if(isYuvBuffer(hnd)) {
-            type = MDPCOMP_OV_VG;
-        } else if(qdutils::MDPVersion::getInstance().is8x26() &&
-                (ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres > 1024)) {
-            if(qhwc::needsScaling(layer))
-                type = MDPCOMP_OV_RGB;
-        } else if(!qhwc::needsScaling(layer)
-            && Overlay::getDMAMode() != Overlay::DMA_BLOCK_MODE
-            && ctx->mMDP.version >= qdutils::MDSS_V5) {
-            type = MDPCOMP_OV_DMA;
-        }
+        Overlay::PipeSpecs pipeSpecs;
+        pipeSpecs.formatClass = isYuvBuffer(hnd) ?
+                Overlay::FORMAT_YUV : Overlay::FORMAT_RGB;
+        pipeSpecs.needsScaling = qhwc::needsScaling(layer) or
+                (qdutils::MDPVersion::getInstance().is8x26() and
+                ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres > 1024);
+        pipeSpecs.dpy = mDpy;
+        pipeSpecs.fb = false;
+        pipeSpecs.numActiveDisplays = ctx->numActiveDisplays;
 
-        pipe_info.index = getMdpPipe(ctx, type, Overlay::MIXER_DEFAULT);
+        pipe_info.index = ctx->mOverlay->getPipe(pipeSpecs);
+
         if(pipe_info.index == ovutils::OV_INVALID) {
-            ALOGD_IF(isDebug(), "%s: Unable to get pipe type = %d",
-                __FUNCTION__, (int) type);
+            ALOGD_IF(isDebug(), "%s: Unable to get pipe", __FUNCTION__);
             return false;
         }
     }
@@ -1418,18 +1769,8 @@ int MDPCompNonSplit::configure4k2kYuv(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
 bool MDPCompNonSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
 
-    if(!isEnabled()) {
-        ALOGD_IF(isDebug(),"%s: MDP Comp not configured", __FUNCTION__);
-        return true;
-    }
-
-    if(!ctx || !list) {
-        ALOGE("%s: invalid contxt or list",__FUNCTION__);
-        return false;
-    }
-
-    if(ctx->listStats[mDpy].numAppLayers > MAX_NUM_APP_LAYERS) {
-        ALOGD_IF(isDebug(),"%s: Exceeding max layer count", __FUNCTION__);
+    if(!isEnabled() or !mModeOn) {
+        ALOGD_IF(isDebug(),"%s: MDP Comp not enabled/configured", __FUNCTION__);
         return true;
     }
 
@@ -1468,7 +1809,7 @@ bool MDPCompNonSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
             ovutils::eDest indexL = pipe_info.lIndex;
             ovutils::eDest indexR = pipe_info.rIndex;
             int fd = hnd->fd;
-            uint32_t offset = hnd->offset;
+            uint32_t offset = (uint32_t)hnd->offset;
             if(rot) {
                 rot->queueBuffer(fd, offset);
                 fd = rot->getDstMemId();
@@ -1509,12 +1850,19 @@ bool MDPCompNonSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
                 continue;
             }
 
+            int fd = hnd->fd;
+            uint32_t offset = (uint32_t)hnd->offset;
+            int index = ctx->mPtorInfo.getPTORArrayIndex(i);
+            if (!mDpy && (index != -1)) {
+                hnd = ctx->mCopyBit[mDpy]->getCurrentRenderBuffer();
+                fd = hnd->fd;
+                // Use the offset of the RenderBuffer
+                offset = ctx->mPtorInfo.mRenderBuffOffset[index];
+            }
+
             ALOGD_IF(isDebug(),"%s: MDP Comp: Drawing layer: %p hnd: %p \
                     using  pipe: %d", __FUNCTION__, layer,
                     hnd, dest );
-
-            int fd = hnd->fd;
-            uint32_t offset = hnd->offset;
 
             Rotator *rot = mCurrentFrame.mdpToLayer[mdpIndex].rot;
             if(rot) {
@@ -1551,30 +1899,42 @@ void MDPCompSplit::adjustForSourceSplit(hwc_context_t *ctx,
         if((dst.left > lSplit) || (dst.right < lSplit)) {
             mCurrentFrame.mdpCount += 1;
         }
-        if(mCurrentFrame.fbZ > n4k2kYuvIndex){
+        if(mCurrentFrame.fbZ >= n4k2kYuvIndex){
             mCurrentFrame.fbZ += 1;
         }
     }
 }
 
 bool MDPCompSplit::acquireMDPPipes(hwc_context_t *ctx, hwc_layer_1_t* layer,
-        MdpPipeInfoSplit& pipe_info,
-        ePipeType type) {
-    const int xres = ctx->dpyAttr[mDpy].xres;
-    const int lSplit = getLeftSplit(ctx, mDpy);
+        MdpPipeInfoSplit& pipe_info) {
 
+    const int lSplit = getLeftSplit(ctx, mDpy);
+    private_handle_t *hnd = (private_handle_t *)layer->handle;
     hwc_rect_t dst = layer->displayFrame;
     pipe_info.lIndex = ovutils::OV_INVALID;
     pipe_info.rIndex = ovutils::OV_INVALID;
 
-    if (dst.left < lSplit) {
-        pipe_info.lIndex = getMdpPipe(ctx, type, Overlay::MIXER_LEFT);
+    Overlay::PipeSpecs pipeSpecs;
+    pipeSpecs.formatClass = isYuvBuffer(hnd) ?
+            Overlay::FORMAT_YUV : Overlay::FORMAT_RGB;
+    pipeSpecs.needsScaling = qhwc::needsScalingWithSplit(ctx, layer, mDpy);
+    pipeSpecs.dpy = mDpy;
+    pipeSpecs.mixer = Overlay::MIXER_LEFT;
+    pipeSpecs.fb = false;
+
+    // Acquire pipe only for the updating half
+    hwc_rect_t l_roi = ctx->listStats[mDpy].lRoi;
+    hwc_rect_t r_roi = ctx->listStats[mDpy].rRoi;
+
+    if (dst.left < lSplit && isValidRect(getIntersection(dst, l_roi))) {
+        pipe_info.lIndex = ctx->mOverlay->getPipe(pipeSpecs);
         if(pipe_info.lIndex == ovutils::OV_INVALID)
             return false;
     }
 
-    if(dst.right > lSplit) {
-        pipe_info.rIndex = getMdpPipe(ctx, type, Overlay::MIXER_RIGHT);
+    if(dst.right > lSplit && isValidRect(getIntersection(dst, r_roi))) {
+        pipeSpecs.mixer = Overlay::MIXER_RIGHT;
+        pipe_info.rIndex = ctx->mOverlay->getPipe(pipeSpecs);
         if(pipe_info.rIndex == ovutils::OV_INVALID)
             return false;
     }
@@ -1594,7 +1954,7 @@ bool MDPCompSplit::allocLayerPipes(hwc_context_t *ctx,
         const int lSplit = getLeftSplit(ctx, mDpy);
         if(is4kx2kYuvBuffer(hnd) && sEnable4k2kYUVSplit){
             if((dst.left > lSplit)||(dst.right < lSplit)){
-                if(allocSplitVGPipesfor4k2k(ctx, list, index)){
+                if(allocSplitVGPipesfor4k2k(ctx, index)){
                     continue;
                 }
             }
@@ -1604,19 +1964,10 @@ bool MDPCompSplit::allocLayerPipes(hwc_context_t *ctx,
         info.pipeInfo = new MdpPipeInfoSplit;
         info.rot = NULL;
         MdpPipeInfoSplit& pipe_info = *(MdpPipeInfoSplit*)info.pipeInfo;
-        ePipeType type = MDPCOMP_OV_ANY;
 
-        if(isYuvBuffer(hnd)) {
-            type = MDPCOMP_OV_VG;
-        } else if(!qhwc::needsScalingWithSplit(ctx, layer, mDpy)
-            && Overlay::getDMAMode() != Overlay::DMA_BLOCK_MODE
-            && ctx->mMDP.version >= qdutils::MDSS_V5) {
-            type = MDPCOMP_OV_DMA;
-        }
-
-        if(!acquireMDPPipes(ctx, layer, pipe_info, type)) {
-            ALOGD_IF(isDebug(), "%s: Unable to get pipe for type = %d",
-                    __FUNCTION__, (int) type);
+        if(!acquireMDPPipes(ctx, layer, pipe_info)) {
+            ALOGD_IF(isDebug(), "%s: Unable to get pipe for type",
+                    __FUNCTION__);
             return false;
         }
     }
@@ -1666,18 +2017,8 @@ int MDPCompSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
 bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
 
-    if(!isEnabled()) {
-        ALOGD_IF(isDebug(),"%s: MDP Comp not configured", __FUNCTION__);
-        return true;
-    }
-
-    if(!ctx || !list) {
-        ALOGE("%s: invalid contxt or list",__FUNCTION__);
-        return false;
-    }
-
-    if(ctx->listStats[mDpy].numAppLayers > MAX_NUM_APP_LAYERS) {
-        ALOGD_IF(isDebug(),"%s: Exceeding max layer count", __FUNCTION__);
+    if(!isEnabled() or !mModeOn) {
+        ALOGD_IF(isDebug(),"%s: MDP Comp not enabled/configured", __FUNCTION__);
         return true;
     }
 
@@ -1715,7 +2056,7 @@ bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
             ovutils::eDest indexL = pipe_info.lIndex;
             ovutils::eDest indexR = pipe_info.rIndex;
             int fd = hnd->fd;
-            uint32_t offset = hnd->offset;
+            uint32_t offset = (uint32_t)hnd->offset;
             if(rot) {
                 rot->queueBuffer(fd, offset);
                 fd = rot->getDstMemId();
@@ -1752,13 +2093,17 @@ bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
             ovutils::eDest indexR = pipe_info.rIndex;
 
             int fd = hnd->fd;
-            int offset = hnd->offset;
+            uint32_t offset = (uint32_t)hnd->offset;
+            int index = ctx->mPtorInfo.getPTORArrayIndex(i);
+            if (!mDpy && (index != -1)) {
+                hnd = ctx->mCopyBit[mDpy]->getCurrentRenderBuffer();
+                fd = hnd->fd;
+                offset = ctx->mPtorInfo.mRenderBuffOffset[index];
+            }
 
-            if(ctx->mAD->isModeOn()) {
-                if(ctx->mAD->draw(ctx, fd, offset)) {
-                    fd = ctx->mAD->getDstFd(ctx);
-                    offset = ctx->mAD->getDstOffset(ctx);
-                }
+            if(ctx->mAD->draw(ctx, fd, offset)) {
+                fd = ctx->mAD->getDstFd();
+                offset = ctx->mAD->getDstOffset();
             }
 
             if(rot) {
@@ -1797,5 +2142,168 @@ bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
 
     return true;
 }
+
+//================MDPCompSrcSplit==============================================
+bool MDPCompSrcSplit::acquireMDPPipes(hwc_context_t *ctx, hwc_layer_1_t* layer,
+        MdpPipeInfoSplit& pipe_info) {
+    private_handle_t *hnd = (private_handle_t *)layer->handle;
+    hwc_rect_t dst = layer->displayFrame;
+    hwc_rect_t crop = integerizeSourceCrop(layer->sourceCropf);
+    pipe_info.lIndex = ovutils::OV_INVALID;
+    pipe_info.rIndex = ovutils::OV_INVALID;
+
+    //If 2 pipes are staged on a single stage of a mixer, then the left pipe
+    //should have a higher priority than the right one. Pipe priorities are
+    //starting with VG0, VG1 ... , RGB0 ..., DMA1
+
+    Overlay::PipeSpecs pipeSpecs;
+    pipeSpecs.formatClass = isYuvBuffer(hnd) ?
+            Overlay::FORMAT_YUV : Overlay::FORMAT_RGB;
+    pipeSpecs.needsScaling = qhwc::needsScaling(layer);
+    pipeSpecs.dpy = mDpy;
+    pipeSpecs.fb = false;
+
+    //1 pipe by default for a layer
+    pipe_info.lIndex = ctx->mOverlay->getPipe(pipeSpecs);
+    if(pipe_info.lIndex == ovutils::OV_INVALID) {
+        return false;
+    }
+
+    //If layer's crop width or dest width > 2048, use 2 pipes
+    if((dst.right - dst.left) > qdutils::MAX_DISPLAY_DIM or
+            (crop.right - crop.left) > qdutils::MAX_DISPLAY_DIM) {
+        pipe_info.rIndex = ctx->mOverlay->getPipe(pipeSpecs);
+        if(pipe_info.rIndex == ovutils::OV_INVALID) {
+            return false;
+        }
+
+        // Return values
+        // 1  Left pipe is higher priority, do nothing.
+        // 0  Pipes of same priority.
+        //-1  Right pipe is of higher priority, needs swap.
+        if(ctx->mOverlay->comparePipePriority(pipe_info.lIndex,
+                pipe_info.rIndex) == -1) {
+            qhwc::swap(pipe_info.lIndex, pipe_info.rIndex);
+        }
+    }
+
+    return true;
+}
+
+int MDPCompSrcSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
+        PipeLayerPair& PipeLayerPair) {
+    private_handle_t *hnd = (private_handle_t *)layer->handle;
+    if(!hnd) {
+        ALOGE("%s: layer handle is NULL", __FUNCTION__);
+        return -1;
+    }
+    MetaData_t *metadata = (MetaData_t *)hnd->base_metadata;
+    MdpPipeInfoSplit& mdp_info =
+        *(static_cast<MdpPipeInfoSplit*>(PipeLayerPair.pipeInfo));
+    Rotator **rot = &PipeLayerPair.rot;
+    eZorder z = static_cast<eZorder>(mdp_info.zOrder);
+    eIsFg isFg = IS_FG_OFF;
+    eDest lDest = mdp_info.lIndex;
+    eDest rDest = mdp_info.rIndex;
+    hwc_rect_t crop = integerizeSourceCrop(layer->sourceCropf);
+    hwc_rect_t dst = layer->displayFrame;
+    int transform = layer->transform;
+    eTransform orient = static_cast<eTransform>(transform);
+    const int downscale = 0;
+    int rotFlags = ROT_FLAGS_NONE;
+    uint32_t format = ovutils::getMdpFormat(hnd->format, isTileRendered(hnd));
+    Whf whf(getWidth(hnd), getHeight(hnd), format, hnd->size);
+
+    ALOGD_IF(isDebug(),"%s: configuring: layer: %p z_order: %d dest_pipeL: %d"
+             "dest_pipeR: %d",__FUNCTION__, layer, z, lDest, rDest);
+
+    // Handle R/B swap
+    if (layer->flags & HWC_FORMAT_RB_SWAP) {
+        if (hnd->format == HAL_PIXEL_FORMAT_RGBA_8888)
+            whf.format = getMdpFormat(HAL_PIXEL_FORMAT_BGRA_8888);
+        else if (hnd->format == HAL_PIXEL_FORMAT_RGBX_8888)
+            whf.format = getMdpFormat(HAL_PIXEL_FORMAT_BGRX_8888);
+    }
+
+    eMdpFlags mdpFlags = OV_MDP_BACKEND_COMPOSITION;
+    setMdpFlags(layer, mdpFlags, 0, transform);
+
+    if(lDest != OV_INVALID && rDest != OV_INVALID) {
+        //Enable overfetch
+        setMdpFlags(mdpFlags, OV_MDSS_MDP_DUAL_PIPE);
+    }
+
+    if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
+        (*rot) = ctx->mRotMgr->getNext();
+        if((*rot) == NULL) return -1;
+        ctx->mLayerRotMap[mDpy]->add(layer, *rot);
+        //If the video is using a single pipe, enable BWC
+        if(rDest == OV_INVALID) {
+            BwcPM::setBwc(crop, dst, transform, mdpFlags);
+        }
+        //Configure rotator for pre-rotation
+        if(configRotator(*rot, whf, crop, mdpFlags, orient, downscale) < 0) {
+            ALOGE("%s: configRotator failed!", __FUNCTION__);
+            return -1;
+        }
+        whf.format = (*rot)->getDstFormat();
+        updateSource(orient, whf, crop);
+        rotFlags |= ROT_PREROTATED;
+    }
+
+    //If 2 pipes being used, divide layer into half, crop and dst
+    hwc_rect_t cropL = crop;
+    hwc_rect_t cropR = crop;
+    hwc_rect_t dstL = dst;
+    hwc_rect_t dstR = dst;
+    if(lDest != OV_INVALID && rDest != OV_INVALID) {
+        cropL.right = (crop.right + crop.left) / 2;
+        cropR.left = cropL.right;
+        sanitizeSourceCrop(cropL, cropR, hnd);
+
+        //Swap crops on H flip since 2 pipes are being used
+        if((orient & OVERLAY_TRANSFORM_FLIP_H) && (*rot) == NULL) {
+            hwc_rect_t tmp = cropL;
+            cropL = cropR;
+            cropR = tmp;
+        }
+
+        dstL.right = (dst.right + dst.left) / 2;
+        dstR.left = dstL.right;
+    }
+
+    //For the mdp, since either we are pre-rotating or MDP does flips
+    orient = OVERLAY_TRANSFORM_0;
+    transform = 0;
+
+    //configure left pipe
+    if(lDest != OV_INVALID) {
+        PipeArgs pargL(mdpFlags, whf, z, isFg,
+                static_cast<eRotFlags>(rotFlags), layer->planeAlpha,
+                (ovutils::eBlending) getBlending(layer->blending));
+
+        if(configMdp(ctx->mOverlay, pargL, orient,
+                    cropL, dstL, metadata, lDest) < 0) {
+            ALOGE("%s: commit failed for left mixer config", __FUNCTION__);
+            return -1;
+        }
+    }
+
+    //configure right pipe
+    if(rDest != OV_INVALID) {
+        PipeArgs pargR(mdpFlags, whf, z, isFg,
+                static_cast<eRotFlags>(rotFlags),
+                layer->planeAlpha,
+                (ovutils::eBlending) getBlending(layer->blending));
+        if(configMdp(ctx->mOverlay, pargR, orient,
+                    cropR, dstR, metadata, rDest) < 0) {
+            ALOGE("%s: commit failed for right mixer config", __FUNCTION__);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
 }; //namespace
 

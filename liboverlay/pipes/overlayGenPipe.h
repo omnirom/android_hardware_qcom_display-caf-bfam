@@ -54,6 +54,8 @@ public:
     void setPosition(const utils::Dim& dim);
     /* set visual param */
     bool setVisualParams(const MetaData_t &metadata);
+    /* set pipe type RGB/DMA/VG */
+    void setPipeType(const utils::eMdpPipeType& pType);
     /* commit changes to the overlay "set"*/
     bool commit();
     /* Data APIs */
@@ -69,6 +71,8 @@ public:
     bool isOpen() const;
     /* return Ctrl fd. Used for S3D */
     int getCtrlFd() const;
+    /* return pipe priority */
+    uint8_t getPriority() const;
     /* dump the state of the object */
     void dump() const;
     /* Return the dump in the specified buffer */

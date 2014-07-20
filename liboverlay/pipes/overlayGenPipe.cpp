@@ -68,6 +68,10 @@ bool GenericPipe::setVisualParams(const MetaData_t &metadata)
         return mCtrl->setVisualParams(metadata);
 }
 
+void GenericPipe::setPipeType(const utils::eMdpPipeType& pType) {
+    mCtrl->setPipeType(pType);
+}
+
 bool GenericPipe::commit() {
     bool ret = false;
     int downscale_factor = utils::ROT_DS_NONE;
@@ -104,6 +108,10 @@ int GenericPipe::getCtrlFd() const {
 utils::Dim GenericPipe::getCrop() const
 {
     return mCtrl->getCrop();
+}
+
+uint8_t GenericPipe::getPriority() const {
+    return mCtrl->getPriority();
 }
 
 void GenericPipe::dump() const
