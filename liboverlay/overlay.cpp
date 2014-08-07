@@ -45,7 +45,8 @@ using namespace utils;
 
 
 Overlay::Overlay() {
-    PipeBook::NUM_PIPES = qdutils::MDPVersion::getInstance().getTotalPipes();
+    int numPipes = qdutils::MDPVersion::getInstance().getTotalPipes();
+    PipeBook::NUM_PIPES = (numPipes <= utils::OV_MAX)? numPipes : utils::OV_MAX;
     for(int i = 0; i < PipeBook::NUM_PIPES; i++) {
         mPipeBook[i].init();
     }
@@ -79,11 +80,11 @@ void Overlay::configDone() {
             //fds
             if(mPipeBook[i].valid()) {
                 char str[32];
-                sprintf(str, "Unset=%s dpy=%d mix=%d; ",
+                snprintf(str, 32, "Unset=%s dpy=%d mix=%d; ",
                         PipeBook::getDestStr((eDest)i),
                         mPipeBook[i].mDisplay, mPipeBook[i].mMixer);
 #if PIPE_DEBUG
-                strncat(mDumpStr, str, strlen(str));
+                strlcat(mDumpStr, str, sizeof(mDumpStr));
 #endif
             }
             mPipeBook[i].destroy();
@@ -146,7 +147,7 @@ eDest Overlay::nextPipe(eMdpPipeType type, int dpy, int mixer) {
             snprintf(str, 32, "Set=%s dpy=%d mix=%d; ",
                      PipeBook::getDestStr(dest), dpy, mixer);
 #if PIPE_DEBUG
-            strncat(mDumpStr, str, strlen(str));
+            strlcat(mDumpStr, str, sizeof(mDumpStr));
 #endif
         }
     } else {
@@ -176,14 +177,13 @@ bool Overlay::isPipeTypeAttached(eMdpPipeType type) {
 
 bool Overlay::commit(utils::eDest dest) {
     bool ret = false;
-    int index = (int)dest;
-    validate(index);
+    validate((int)dest);
 
-    if(mPipeBook[index].mPipe->commit()) {
+    if(mPipeBook[dest].mPipe->commit()) {
         ret = true;
         PipeBook::setUse((int)dest);
     } else {
-        int dpy = mPipeBook[index].mDisplay;
+        int dpy = mPipeBook[dest].mDisplay;
         for(int i = 0; i < PipeBook::NUM_PIPES; i++) {
             if (mPipeBook[i].mDisplay == dpy) {
                 PipeBook::resetAllocation(i);
@@ -196,73 +196,59 @@ bool Overlay::commit(utils::eDest dest) {
 
 bool Overlay::queueBuffer(int fd, uint32_t offset,
         utils::eDest dest) {
-    int index = (int)dest;
     bool ret = false;
-    validate(index);
+    validate((int)dest);
     //Queue only if commit() has succeeded (and the bit set)
     if(PipeBook::isUsed((int)dest)) {
-        ret = mPipeBook[index].mPipe->queueBuffer(fd, offset);
+        ret = mPipeBook[dest].mPipe->queueBuffer(fd, offset);
     }
     return ret;
 }
 
 void Overlay::setCrop(const utils::Dim& d,
         utils::eDest dest) {
-    int index = (int)dest;
-    validate(index);
-    mPipeBook[index].mPipe->setCrop(d);
+    validate((int)dest);
+    mPipeBook[dest].mPipe->setCrop(d);
 }
 
 void Overlay::setColor(const uint32_t color,
         utils::eDest dest) {
-    int index = (int)dest;
-    validate(index);
-    mPipeBook[index].mPipe->setColor(color);
+    validate((int)dest);
+    mPipeBook[dest].mPipe->setColor(color);
 }
 
 void Overlay::setPosition(const utils::Dim& d,
         utils::eDest dest) {
-    int index = (int)dest;
-    validate(index);
-    mPipeBook[index].mPipe->setPosition(d);
+    validate((int)dest);
+    mPipeBook[dest].mPipe->setPosition(d);
 }
 
 void Overlay::setTransform(const int orient,
         utils::eDest dest) {
-    int index = (int)dest;
-    validate(index);
+    validate((int)dest);
 
     utils::eTransform transform =
             static_cast<utils::eTransform>(orient);
-    mPipeBook[index].mPipe->setTransform(transform);
+    mPipeBook[dest].mPipe->setTransform(transform);
 
 }
 
 void Overlay::setSource(const utils::PipeArgs args,
         utils::eDest dest) {
-    int index = (int)dest;
-    validate(index);
+    validate((int)dest);
 
-    PipeArgs newArgs(args);
-    if(PipeBook::getPipeType(dest) == OV_MDP_PIPE_VG) {
-        setMdpFlags(newArgs.mdpFlags, OV_MDP_PIPE_SHARE);
-    } else {
-        clearMdpFlags(newArgs.mdpFlags, OV_MDP_PIPE_SHARE);
-    }
-
-    if(PipeBook::getPipeType(dest) == OV_MDP_PIPE_DMA) {
-        setMdpFlags(newArgs.mdpFlags, OV_MDP_PIPE_FORCE_DMA);
-    } else {
-        clearMdpFlags(newArgs.mdpFlags, OV_MDP_PIPE_FORCE_DMA);
-    }
-
-    mPipeBook[index].mPipe->setSource(newArgs);
+    setPipeType(dest, PipeBook::getPipeType(dest));
+    mPipeBook[dest].mPipe->setSource(args);
 }
 
 void Overlay::setVisualParams(const MetaData_t& metadata, utils::eDest dest) {
-    int index = (int)dest;
-    validate(index);
-    mPipeBook[index].mPipe->setVisualParams(metadata);
+    validate((int)dest);
+    mPipeBook[dest].mPipe->setVisualParams(metadata);
+}
+
+void Overlay::setPipeType(utils::eDest pipeIndex,
+        const utils::eMdpPipeType pType) {
+    mPipeBook[pipeIndex].mPipe->setPipeType(pType);
 }
 
 Overlay* Overlay::getInstance() {
@@ -396,19 +382,19 @@ void Overlay::dump() const {
 void Overlay::getDump(char *buf, size_t len) {
     int totalPipes = 0;
     const char *str = "\nOverlay State\n\n";
-    strncat(buf, str, strlen(str));
+    strlcat(buf, str, len);
     for(int i = 0; i < PipeBook::NUM_PIPES; i++) {
         if(mPipeBook[i].valid()) {
             mPipeBook[i].mPipe->getDump(buf, len);
             char str[64] = {'\0'};
             snprintf(str, 64, "Display=%d\n\n", mPipeBook[i].mDisplay);
-            strncat(buf, str, strlen(str));
+            strlcat(buf, str, len);
             totalPipes++;
         }
     }
     char str_pipes[64] = {'\0'};
     snprintf(str_pipes, 64, "Pipes=%d\n\n", totalPipes);
-    strncat(buf, str_pipes, strlen(str_pipes));
+    strlcat(buf, str_pipes, len);
 }
 
 void Overlay::clear(int dpy) {
@@ -423,7 +409,7 @@ void Overlay::clear(int dpy) {
 
 bool Overlay::validateAndSet(const int& dpy, const int& fbFd) {
     GenericPipe* pipeArray[PipeBook::NUM_PIPES];
-    memset(&pipeArray, 0, sizeof(pipeArray));
+    memset(pipeArray, 0, sizeof(GenericPipe*)*(PipeBook::NUM_PIPES));
 
     int num = 0;
     for(int i = 0; i < PipeBook::NUM_PIPES; i++) {

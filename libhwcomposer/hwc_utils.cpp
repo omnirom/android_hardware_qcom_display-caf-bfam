@@ -130,6 +130,7 @@ static int openFramebufferDevice(hwc_context_t *ctx)
 void initContext(hwc_context_t *ctx)
 {
     openFramebufferDevice(ctx);
+    char value[PROPERTY_VALUE_MAX];
     ctx->mMDP.version = qdutils::MDPVersion::getInstance().getMDPVersion();
     ctx->mMDP.hasOverlay = qdutils::MDPVersion::getInstance().hasOverlay();
     ctx->mMDP.panel = qdutils::MDPVersion::getInstance().getPanelType();
@@ -181,12 +182,17 @@ void initContext(hwc_context_t *ctx)
         ctx->dpyAttr[i].mAsHeightRatio = 0;
     }
 
+    for (uint32_t i = 0; i < HWC_NUM_DISPLAY_TYPES; i++) {
+        ctx->mPrevHwLayerCount[i] = 0;
+    }
+
     MDPComp::init(ctx);
     ctx->mAD = new AssertiveDisplay(ctx);
 
     ctx->vstate.enable = false;
     ctx->vstate.fakevsync = false;
     ctx->mExtOrientation = 0;
+    ctx->numActiveDisplays = 1;
 
     //Right now hwc starts the service but anybody could do it, or it could be
     //independent process as well.
@@ -203,7 +209,6 @@ void initContext(hwc_context_t *ctx)
 
     // Read the system property to determine if downscale feature is enabled.
     ctx->mMDPDownscaleEnabled = false;
-    char value[PROPERTY_VALUE_MAX];
     if(property_get("sys.hwc.mdp_downscale_enabled", value, "false")
             && !strcmp(value, "true")) {
         ctx->mMDPDownscaleEnabled = true;
@@ -363,7 +368,6 @@ void getActionSafePosition(hwc_context_t *ctx, int dpy, hwc_rect_t& rect) {
 // based on the position and aspect ratio with orientation
 void getAspectRatioPosition(hwc_context_t* ctx, int dpy, int extOrientation,
                             hwc_rect_t& inRect, hwc_rect_t& outRect) {
-    hwc_rect_t viewFrame = ctx->mViewFrame[dpy];
     // Physical display resolution
     float fbWidth  = ctx->dpyAttr[dpy].xres;
     float fbHeight = ctx->dpyAttr[dpy].yres;
@@ -401,17 +405,11 @@ void getAspectRatioPosition(hwc_context_t* ctx, int dpy, int extOrientation,
         yPos = rect.top;
         width = rect.right - rect.left;
         height = rect.bottom - rect.top;
-        // swap viewframe coordinates for 90 degree rotation.
-        swap(viewFrame.left, viewFrame.top);
-        swap(viewFrame.right, viewFrame.bottom);
     }
-    // if viewframe left and top coordinates are non zero value then exclude it
-    // during the computation of xRatio and yRatio
-    xRatio = (inPos.x - viewFrame.left)/actualWidth;
-    yRatio = (inPos.y - viewFrame.top)/actualHeight;
-    // Use viewframe width and height to compute wRatio and hRatio.
-    wRatio = (float)inPos.w/(float)(viewFrame.right - viewFrame.left);
-    hRatio = (float)inPos.h/(float)(viewFrame.bottom - viewFrame.top);
+    xRatio = inPos.x/actualWidth;
+    yRatio = inPos.y/actualHeight;
+    wRatio = inPos.w/actualWidth;
+    hRatio = inPos.h/actualHeight;
 
 
     //Calculate the position...
@@ -429,7 +427,7 @@ void getAspectRatioPosition(hwc_context_t* ctx, int dpy, int extOrientation,
     // the position based on the new width and height
     if ((extOrientation & HWC_TRANSFORM_ROT_90) &&
                         isOrientationPortrait(ctx)) {
-        hwc_rect_t r;
+        hwc_rect_t r = {0, 0, 0, 0};
         //Calculate the position
         xRatio = (outPos.x - xPos)/width;
         // GetaspectRatio -- tricky to get the correct aspect ratio
@@ -587,6 +585,21 @@ int getMirrorModeOrientation(hwc_context_t *ctx) {
     return extOrientation;
 }
 
+/* Get External State names */
+const char* getExternalDisplayState(uint32_t external_state) {
+    static const char* externalStates[EXTERNAL_MAXSTATES] = {0};
+    externalStates[EXTERNAL_OFFLINE] = STR(EXTERNAL_OFFLINE);
+    externalStates[EXTERNAL_ONLINE]  = STR(EXTERNAL_ONLINE);
+    externalStates[EXTERNAL_PAUSE]   = STR(EXTERNAL_PAUSE);
+    externalStates[EXTERNAL_RESUME]  = STR(EXTERNAL_RESUME);
+
+    if(external_state >= EXTERNAL_MAXSTATES) {
+        return "EXTERNAL_INVALID";
+    }
+
+    return externalStates[external_state];
+}
+
 bool isDownscaleRequired(hwc_layer_1_t const* layer) {
     hwc_rect_t displayFrame  = layer->displayFrame;
     hwc_rect_t sourceCrop = integerizeSourceCrop(layer->sourceCropf);
@@ -710,8 +723,10 @@ static void trimList(hwc_context_t *ctx, hwc_display_contents_1_t *list,
     for(uint32_t i = 0; i < list->numHwLayers - 1; i++) {
         hwc_layer_1_t *layer = &list->hwLayers[i];
         hwc_rect_t crop = integerizeSourceCrop(layer->sourceCropf);
+        int transform = (list->hwLayers[i].flags & HWC_COLOR_FILL) ? 0 :
+                list->hwLayers[i].transform;
         trimLayer(ctx, dpy,
-                list->hwLayers[i].transform,
+                transform,
                 (hwc_rect_t&)crop,
                 (hwc_rect_t&)list->hwLayers[i].displayFrame);
         layer->sourceCropf.left = crop.left;
@@ -719,28 +734,6 @@ static void trimList(hwc_context_t *ctx, hwc_display_contents_1_t *list,
         layer->sourceCropf.top = crop.top;
         layer->sourceCropf.bottom = crop.bottom;
     }
-}
-
-hwc_rect_t calculateDisplayViewFrame(hwc_context_t *ctx, int dpy) {
-    int dstWidth = ctx->dpyAttr[dpy].xres;
-    int dstHeight = ctx->dpyAttr[dpy].yres;
-    int srcWidth = ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xres;
-    int srcHeight = ctx->dpyAttr[HWC_DISPLAY_PRIMARY].yres;
-    // default we assume viewframe as a full frame for primary display
-    hwc_rect outRect = {0, 0, dstWidth, dstHeight};
-    if(dpy) {
-        // swap srcWidth and srcHeight, if the device orientation is 90 or 270.
-        if(ctx->deviceOrientation & 0x1) {
-            swap(srcWidth, srcHeight);
-        }
-        // Get Aspect Ratio for external
-        getAspectRatioPosition(dstWidth, dstHeight, srcWidth,
-                            srcHeight, outRect);
-    }
-    ALOGD_IF(HWC_UTILS_DEBUG, "%s: view frame for dpy %d is [%d %d %d %d]",
-        __FUNCTION__, dpy, outRect.left, outRect.top,
-        outRect.right, outRect.bottom);
-    return outRect;
 }
 
 void setListStats(hwc_context_t *ctx,
@@ -760,15 +753,10 @@ void setListStats(hwc_context_t *ctx,
                       (int)ctx->dpyAttr[dpy].xres, (int)ctx->dpyAttr[dpy].yres);
     ctx->listStats[dpy].secureUI = false;
     ctx->listStats[dpy].yuv4k2kCount = 0;
-    ctx->mViewFrame[dpy] = (hwc_rect_t){0, 0, 0, 0};
     ctx->dpyAttr[dpy].mActionSafePresent = isActionSafePresent(ctx, dpy);
 
     trimList(ctx, list, dpy);
     optimizeLayerRects(ctx, list, dpy);
-
-    // Calculate view frame of ext display from primary resolution
-    // and primary device orientation.
-    ctx->mViewFrame[dpy] = calculateDisplayViewFrame(ctx, dpy);
 
     for (size_t i = 0; i < (size_t)ctx->listStats[dpy].numAppLayers; i++) {
         hwc_layer_1_t const* layer = &list->hwLayers[i];
@@ -808,15 +796,6 @@ void setListStats(hwc_context_t *ctx,
                 ctx->listStats[dpy].yuv4k2kIndices[yuv4k2kCount] = i;
                 yuv4k2kCount++;
             }
-
-            if((layer->transform & HWC_TRANSFORM_ROT_90) &&
-                    canUseRotator(ctx, dpy)) {
-                if( (dpy == HWC_DISPLAY_PRIMARY) &&
-                        ctx->mOverlay->isPipeTypeAttached(OV_MDP_PIPE_DMA)) {
-                    ctx->isPaddingRound = true;
-                }
-                Overlay::setDMAMode(Overlay::DMA_BLOCK_MODE);
-            }
         }
         if(layer->blending == HWC_BLENDING_PREMULT)
             ctx->listStats[dpy].preMultipliedAlpha = true;
@@ -839,31 +818,13 @@ void setListStats(hwc_context_t *ctx,
             }
         }
     }
-    if(dpy) {
-        //uncomment the below code for testing purpose.
-        /* char value[PROPERTY_VALUE_MAX];
-        property_get("sys.ext_orientation", value, "0");
-        // Assuming the orientation value is in terms of HAL_TRANSFORM,
-        // This needs mapping to HAL, if its in different convention
-        ctx->mExtOrientation = atoi(value); */
-        // Assuming the orientation value is in terms of HAL_TRANSFORM,
-        // This needs mapping to HAL, if its in different convention
-        if(ctx->mExtOrientation || ctx->mBufferMirrorMode) {
-            ALOGD_IF(HWC_UTILS_DEBUG, "%s: ext orientation = %d"
-                     "BufferMirrorMode = %d", __FUNCTION__,
-                     ctx->mExtOrientation, ctx->mBufferMirrorMode);
-            if(ctx->mOverlay->isPipeTypeAttached(OV_MDP_PIPE_DMA)) {
-                ctx->isPaddingRound = true;
-            }
-            Overlay::setDMAMode(Overlay::DMA_BLOCK_MODE);
-        }
-    }
 
     //The marking of video begin/end is useful on some targets where we need
     //to have a padding round to be able to shift pipes across mixers.
     if(prevYuvCount != ctx->listStats[dpy].yuvCount) {
         ctx->mVideoTransFlag = true;
     }
+
     if(dpy == HWC_DISPLAY_PRIMARY) {
         ctx->mAD->markDoable(ctx, list);
     }
@@ -1107,7 +1068,8 @@ void optimizeLayerRects(hwc_context_t *ctx,
                   hwc_rect_t& bottomframe = layer->displayFrame;
                   hwc_rect_t bottomCrop =
                       integerizeSourceCrop(layer->sourceCropf);
-                  int transform =layer->transform;
+                  int transform = (layer->flags & HWC_COLOR_FILL) ? 0 :
+                      layer->transform;
 
                   hwc_rect_t irect = getIntersection(bottomframe, topframe);
                   if(isValidRect(irect)) {
@@ -1198,25 +1160,30 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
     for(uint32_t i = 0; i < ctx->mLayerRotMap[dpy]->getCount(); i++) {
         int rotFd = ctx->mRotMgr->getRotDevFd();
         int rotReleaseFd = -1;
+        overlay::Rotator* currRot = ctx->mLayerRotMap[dpy]->getRot(i);
+        hwc_layer_1_t* currLayer = ctx->mLayerRotMap[dpy]->getLayer(i);
+        if((currRot == NULL) || (currLayer == NULL)) {
+            continue;
+        }
         struct mdp_buf_sync rotData;
         memset(&rotData, 0, sizeof(rotData));
         rotData.acq_fen_fd =
-                &ctx->mLayerRotMap[dpy]->getLayer(i)->acquireFenceFd;
+                &currLayer->acquireFenceFd;
         rotData.rel_fen_fd = &rotReleaseFd; //driver to populate this
-        rotData.session_id = ctx->mLayerRotMap[dpy]->getRot(i)->getSessId();
+        rotData.session_id = currRot->getSessId();
         int ret = 0;
         ret = ioctl(rotFd, MSMFB_BUFFER_SYNC, &rotData);
         if(ret < 0) {
             ALOGE("%s: ioctl MSMFB_BUFFER_SYNC failed for rot sync, err=%s",
                     __FUNCTION__, strerror(errno));
         } else {
-            close(ctx->mLayerRotMap[dpy]->getLayer(i)->acquireFenceFd);
+            close(currLayer->acquireFenceFd);
             //For MDP to wait on.
-            ctx->mLayerRotMap[dpy]->getLayer(i)->acquireFenceFd =
+            currLayer->acquireFenceFd =
                     dup(rotReleaseFd);
             //A buffer is free to be used by producer as soon as its copied to
             //rotator
-            ctx->mLayerRotMap[dpy]->getLayer(i)->releaseFenceFd =
+            currLayer->releaseFenceFd =
                     rotReleaseFd;
         }
     }
@@ -1541,6 +1508,7 @@ int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ((transform & HWC_TRANSFORM_ROT_90) || downscale)) {
         *rot = ctx->mRotMgr->getNext();
         if(*rot == NULL) return -1;
+        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         if(!dpy)
             BwcPM::setBwc(ctx, crop, dst, transform, mdpFlags);
         //Configure rotator for pre-rotation
@@ -1548,7 +1516,6 @@ int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         whf.format = (*rot)->getDstFormat();
         updateSource(orient, whf, crop);
         rotFlags |= ovutils::ROT_PREROTATED;
@@ -1650,12 +1617,12 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
     if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
+        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         //Configure rotator for pre-rotation
         if(configRotator(*rot, whf, crop, mdpFlagsL, orient, downscale) < 0) {
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         whf.format = (*rot)->getDstFormat();
         updateSource(orient, whf, crop);
         rotFlags |= ROT_PREROTATED;
@@ -1780,6 +1747,7 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
     if(isYuvBuffer(hnd) && (transform & HWC_TRANSFORM_ROT_90)) {
         (*rot) = ctx->mRotMgr->getNext();
         if((*rot) == NULL) return -1;
+        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         if(!dpy)
             BwcPM::setBwc(ctx, crop, dst, transform, mdpFlagsL);
         //Configure rotator for pre-rotation
@@ -1787,7 +1755,6 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        ctx->mLayerRotMap[dpy]->add(layer, *rot);
         whf.format = (*rot)->getDstFormat();
         updateSource(orient, whf, crop);
         rotFlags |= ROT_PREROTATED;
@@ -1904,6 +1871,32 @@ bool isDisplaySplit(hwc_context_t* ctx, int dpy) {
         return true;
     }
     return false;
+}
+
+/* Since we fake non-Hybrid WFD solution as external display, this
+ * function helps us in determining the priority between external
+ * (hdmi/non-Hybrid WFD display) and virtual display devices(SSD/
+ * screenrecord). This can be removed once wfd-client migrates to
+ * using virtual-display api's.
+ */
+bool canUseMDPforVirtualDisplay(hwc_context_t* ctx,
+                                const hwc_display_contents_1_t *list) {
+
+    /* We rely on the fact that for pure virtual display solution
+     * list->outbuf will be a non-NULL handle.
+     *
+     * If there are three active displays (which means there is one
+     * primary, one external and one virtual active display)
+     * we give mdss/mdp hw resources(pipes,smp,etc) for external
+     * display(hdmi/non-Hybrid WFD display) rather than for virtual
+     * display(SSD/screenrecord)
+     */
+
+    if(list->outbuf and (ctx->numActiveDisplays == HWC_NUM_DISPLAY_TYPES)) {
+        return false;
+    }
+
+    return true;
 }
 
 void BwcPM::setBwc(hwc_context_t *ctx, const hwc_rect_t& crop,

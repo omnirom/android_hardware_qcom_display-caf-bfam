@@ -35,6 +35,8 @@
 #define LIKELY( exp )       (__builtin_expect( (exp) != 0, true  ))
 #define UNLIKELY( exp )     (__builtin_expect( (exp) != 0, false ))
 #define MAX_NUM_APP_LAYERS 32
+#define HWC_WFDDISPSYNC_LOG 0
+#define STR(f) #f;
 
 //Fwrd decls
 struct hwc_context_t;
@@ -143,6 +145,15 @@ enum {
     HWC_FORMAT_RB_SWAP = 0x00000040,
 };
 
+/* External Display states */
+enum {
+    EXTERNAL_OFFLINE = 0,
+    EXTERNAL_ONLINE,
+    EXTERNAL_PAUSE,
+    EXTERNAL_RESUME,
+    EXTERNAL_MAXSTATES
+};
+
 class LayerRotMap {
 public:
     LayerRotMap() { reset(); }
@@ -199,11 +210,6 @@ inline bool isNonIntegralSourceCrop(const hwc_frect_t& cropF) {
 // -----------------------------------------------------------------------------
 // Utility functions - implemented in hwc_utils.cpp
 void dumpLayer(hwc_layer_1_t const* l);
-
-// Calculate viewframe for external/primary display from primary resolution and
-// primary device orientation
-hwc_rect_t calculateDisplayViewFrame(hwc_context_t *ctx, int dpy);
-
 void setListStats(hwc_context_t *ctx, hwc_display_contents_1_t *list,
         int dpy);
 void initContext(hwc_context_t *ctx);
@@ -226,6 +232,9 @@ void sanitizeSourceCrop(hwc_rect_t& cropL, hwc_rect_t& cropR,
 bool isAlphaPresent(hwc_layer_1_t const* layer);
 int hwc_vsync_control(hwc_context_t* ctx, int dpy, int enable);
 int getBlending(int blending);
+
+bool canUseMDPforVirtualDisplay(hwc_context_t* ctx,
+                                const hwc_display_contents_1_t *list);
 
 //Helper function to dump logs
 void dumpsys_log(android::String8& buf, const char* fmt, ...);
@@ -264,6 +273,9 @@ void calcExtDisplayPosition(hwc_context_t *ctx,
 // Returns the orientation that needs to be set on external for
 // BufferMirrirMode(Sidesync)
 int getMirrorModeOrientation(hwc_context_t *ctx);
+
+/* Get External State names */
+const char* getExternalDisplayState(uint32_t external_state);
 
 // Handles wfd Pause and resume events
 void handle_pause(hwc_context_t *ctx, int dpy);
@@ -453,6 +465,10 @@ struct hwc_context_t {
     qhwc::VPUClient *mVPUClient;
     eAnimationState mAnimationState[HWC_NUM_DISPLAY_TYPES];
 
+    // stores the #numHwLayers of the previous frame
+    // for each display device
+    int mPrevHwLayerCount[HWC_NUM_DISPLAY_TYPES];
+
     // stores the primary device orientation
     int deviceOrientation;
     //Securing in progress indicator
@@ -469,19 +485,21 @@ struct hwc_context_t {
     int mExtOrientation;
     //Flags the transition of a video session
     bool mVideoTransFlag;
-
     //Used for SideSync feature
     //which overrides the mExtOrientation
     bool mBufferMirrorMode;
+    // Used to synchronize between WFD and Display modules
+    mutable Locker mWfdSyncLock;
 
     qhwc::LayerRotMap *mLayerRotMap[HWC_NUM_DISPLAY_TYPES];
-
     // Panel reset flag will be set if BTA check fails
     bool mPanelResetStatus;
 
     // Downscale feature switch, set via system the property
     // sys.hwc.mdp_downscale_enabled
     bool mMDPDownscaleEnabled;
+    // number of active Displays
+    int numActiveDisplays;
 };
 
 namespace qhwc {

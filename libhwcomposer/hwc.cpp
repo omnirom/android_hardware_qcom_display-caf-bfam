@@ -101,22 +101,119 @@ static void hwc_registerProcs(struct hwc_composer_device_1* dev,
     init_vsync_thread(ctx);
 }
 
-//Helper
+static void setPaddingRound(hwc_context_t *ctx, int numDisplays,
+                            hwc_display_contents_1_t** displays) {
+    ctx->isPaddingRound = false;
+    for(int i = 0; i < numDisplays; i++) {
+        hwc_display_contents_1_t *list = displays[i];
+        if (LIKELY(list && list->numHwLayers > 0)) {
+            if((ctx->mPrevHwLayerCount[i] == 1 or
+                ctx->mPrevHwLayerCount[i] == 0) and
+               (list->numHwLayers > 1)) {
+                /* If the previous cycle for dpy 'i' has 0 AppLayers and the
+                 * current cycle has atleast 1 AppLayer, padding round needs
+                 * to be invoked in current cycle on all the active displays
+                 * to free up the resources.
+                 */
+                ctx->isPaddingRound = true;
+            }
+            ctx->mPrevHwLayerCount[i] = (int)list->numHwLayers;
+        } else {
+            ctx->mPrevHwLayerCount[i] = 0;
+        }
+    }
+}
+
+/* Based on certain conditions, isPaddingRound will be set
+ * to make this function self-contained */
+static void setDMAState(hwc_context_t *ctx, int numDisplays,
+                        hwc_display_contents_1_t** displays) {
+
+    if(ctx->mRotMgr->getNumActiveSessions() == 0)
+        Overlay::setDMAMode(Overlay::DMA_LINE_MODE);
+
+    for(int i = 0; i < numDisplays; i++) {
+        hwc_display_contents_1_t *list = displays[i];
+        if (LIKELY(list && list->numHwLayers > 0)) {
+            for(uint32_t j = 0; j < list->numHwLayers; j++) {
+                if(list->hwLayers[j].compositionType != HWC_FRAMEBUFFER_TARGET)
+                {
+                    hwc_layer_1_t const* layer = &list->hwLayers[i];
+                    private_handle_t *hnd = (private_handle_t *)layer->handle;
+
+                    /* If a video layer requires rotation, set the DMA state
+                     * to BLOCK_MODE */
+
+                    if (UNLIKELY(isYuvBuffer(hnd)) && canUseRotator(ctx,i) &&
+                        (layer->transform & HWC_TRANSFORM_ROT_90)) {
+                        if(not qdutils::MDPVersion::getInstance().is8x26()) {
+                            if(ctx->mOverlay->isPipeTypeAttached(
+                                             overlay::utils::OV_MDP_PIPE_DMA))
+                                ctx->isPaddingRound = true;
+                        }
+                        Overlay::setDMAMode(Overlay::DMA_BLOCK_MODE);
+                    }
+                }
+            }
+            if(i) {
+                /* Uncomment the below code for testing purpose.
+                   Assuming the orientation value is in terms of HAL_TRANSFORM,
+                   this needs mapping to HAL, if its in different convention */
+
+                /* char value[PROPERTY_VALUE_MAX];
+                   property_get("sys.ext_orientation", value, "0");
+                   ctx->mExtOrientation = atoi(value);*/
+
+                if(ctx->mExtOrientation || ctx->mBufferMirrorMode) {
+                    if(ctx->mOverlay->isPipeTypeAttached(
+                                         overlay::utils::OV_MDP_PIPE_DMA)) {
+                        ctx->isPaddingRound = true;
+                    }
+                    Overlay::setDMAMode(Overlay::DMA_BLOCK_MODE);
+                }
+            }
+        }
+    }
+}
+
+static void setNumActiveDisplays(hwc_context_t *ctx, int numDisplays,
+                            hwc_display_contents_1_t** displays) {
+
+    ctx->numActiveDisplays = 0;
+    for(int i = 0; i < numDisplays; i++) {
+        hwc_display_contents_1_t *list = displays[i];
+        if (LIKELY(list && list->numHwLayers > 0)) {
+            /* For display devices like SSD and screenrecord, we cannot
+             * rely on isActive and connected attributes of dpyAttr to
+             * determine if the displaydevice is active. Hence in case if
+             * the layer-list is non-null and numHwLayers > 0, we assume
+             * the display device to be active.
+             */
+            ctx->numActiveDisplays += 1;
+        }
+    }
+}
+
 static void reset(hwc_context_t *ctx, int numDisplays,
                   hwc_display_contents_1_t** displays) {
-    for(int i = 0; i < HWC_NUM_DISPLAY_TYPES; i++) {
+
+
+    for(int i = 0; i < numDisplays; i++) {
         hwc_display_contents_1_t *list = displays[i];
         // XXX:SurfaceFlinger no longer guarantees that this
         // value is reset on every prepare. However, for the layer
         // cache we need to reset it.
         // We can probably rethink that later on
-        if (LIKELY(list && list->numHwLayers > 1)) {
-            for(uint32_t j = 0; j < list->numHwLayers; j++) {
+        if (LIKELY(list && list->numHwLayers > 0)) {
+            for(size_t j = 0; j < list->numHwLayers; j++) {
                 if(list->hwLayers[j].compositionType != HWC_FRAMEBUFFER_TARGET)
                     list->hwLayers[j].compositionType = HWC_FRAMEBUFFER;
             }
+
         }
 
+        if(ctx->mMDPComp[i])
+            ctx->mMDPComp[i]->reset();
         if(ctx->mFBUpdate[i])
             ctx->mFBUpdate[i]->reset();
         if(ctx->mCopyBit[i])
@@ -126,7 +223,6 @@ static void reset(hwc_context_t *ctx, int numDisplays,
     }
 
     ctx->mAD->reset();
-    MDPComp::reset();
 }
 
 //clear prev layer prop flags and realloc for current frame
@@ -202,7 +298,8 @@ static int hwc_prepare_virtual(hwc_composer_device_1 *dev,
 
     if (LIKELY(list && list->numHwLayers > 1) &&
             ctx->dpyAttr[dpy].isActive &&
-            ctx->dpyAttr[dpy].connected) {
+            ctx->dpyAttr[dpy].connected &&
+            canUseMDPforVirtualDisplay(ctx,list)) {
         reset_layer_prop(ctx, dpy, list->numHwLayers - 1);
         if(!ctx->dpyAttr[dpy].isPause) {
             ctx->dpyAttr[dpy].isConfiguring = false;
@@ -239,13 +336,16 @@ static int hwc_prepare(hwc_composer_device_1 *dev, size_t numDisplays,
 
     //Will be unlocked at the end of set
     ctx->mDrawLock.lock();
-    reset(ctx, numDisplays, displays);
+    setPaddingRound(ctx,numDisplays,displays);
+    setDMAState(ctx,numDisplays,displays);
+    setNumActiveDisplays(ctx,numDisplays,displays);
+    reset(ctx, (int)numDisplays, displays);
 
     ctx->mOverlay->configBegin();
     ctx->mRotMgr->configBegin();
     overlay::Writeback::configBegin();
 
-    for (int32_t i = numDisplays; i >= 0; i--) {
+    for (int32_t i = (numDisplays-1); i >= 0; i--) {
         hwc_display_contents_1_t *list = displays[i];
         int dpy = getDpyforExternalDisplay(ctx, i);
         switch(dpy) {
@@ -581,7 +681,8 @@ static int hwc_set_virtual(hwc_context_t *ctx,
 
     if (LIKELY(list) && ctx->dpyAttr[dpy].isActive &&
             ctx->dpyAttr[dpy].connected &&
-            !ctx->dpyAttr[dpy].isPause) {
+            (!ctx->dpyAttr[dpy].isPause) &&
+            canUseMDPforVirtualDisplay(ctx,list)) {
         uint32_t last = list->numHwLayers - 1;
         hwc_layer_1_t *fbLayer = &list->hwLayers[last];
         int fd = -1; //FenceFD from the Copybit(valid in async mode)
@@ -645,7 +746,7 @@ static int hwc_set(hwc_composer_device_1 *dev,
 {
     int ret = 0;
     hwc_context_t* ctx = (hwc_context_t*)(dev);
-    for (uint32_t i = 0; i <= numDisplays; i++) {
+    for (uint32_t i = 0; i < numDisplays; i++) {
         hwc_display_contents_1_t* list = displays[i];
         int dpy = getDpyforExternalDisplay(ctx, i);
         switch(dpy) {
@@ -667,8 +768,6 @@ static int hwc_set(hwc_composer_device_1 *dev,
     CALC_FPS();
     MDPComp::resetIdleFallBack();
     ctx->mVideoTransFlag = false;
-    if(ctx->mRotMgr->getNumActiveSessions() == 0)
-        Overlay::setDMAMode(Overlay::DMA_LINE_MODE);
     //Was locked at the beginning of prepare
     ctx->mDrawLock.unlock();
     return ret;
@@ -803,6 +902,8 @@ static int hwc_device_open(const struct hw_module_t* module, const char* name,
     if (!strcmp(name, HWC_HARDWARE_COMPOSER)) {
         struct hwc_context_t *dev;
         dev = (hwc_context_t*)malloc(sizeof(*dev));
+        if(dev == NULL)
+            return status;
         memset(dev, 0, sizeof(*dev));
 
         //Initialize hwc context

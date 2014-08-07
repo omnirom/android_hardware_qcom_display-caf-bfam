@@ -58,9 +58,10 @@ void IFBUpdate::reset() {
 }
 
 bool IFBUpdate::prepareAndValidate(hwc_context_t *ctx,
-            hwc_display_contents_1 *list, int fbZorder) {
-    return prepare(ctx, list, fbZorder) &&
+                           hwc_display_contents_1 *list, int fbZorder) {
+    mModeOn = prepare(ctx, list, fbZorder) &&
             ctx->mOverlay->validateAndSet(mDpy, ctx->dpyAttr[mDpy].fd);
+    return mModeOn;
 }
 
 //================= Low res====================================
@@ -84,6 +85,7 @@ bool FBUpdateNonSplit::preRotateExtDisplay(hwc_context_t *ctx,
     if(mDpy && (extOrient & HWC_TRANSFORM_ROT_90)) {
         mRot = ctx->mRotMgr->getNext();
         if(mRot == NULL) return false;
+        ctx->mLayerRotMap[mDpy]->add(layer, mRot);
         // Composed FB content will have black bars, if the viewFrame of the
         // external is different from {0, 0, fbWidth, fbHeight}, so intersect
         // viewFrame with sourceCrop to avoid those black bars
@@ -94,7 +96,6 @@ bool FBUpdateNonSplit::preRotateExtDisplay(hwc_context_t *ctx,
             mRot = NULL;
             return false;
         }
-        ctx->mLayerRotMap[mDpy]->add(layer, mRot);
         info.format = (mRot)->getDstFormat();
         updateSource(orient, info, sourceCrop);
         rotFlags |= ovutils::ROT_PREROTATED;
@@ -254,8 +255,8 @@ bool FBUpdateSplit::prepare(hwc_context_t *ctx, hwc_display_contents_1 *list,
                  __FUNCTION__);
         return false;
     }
-    ALOGD_IF(DEBUG_FBUPDATE, "%s, mModeOn = %d", __FUNCTION__, mModeOn);
     mModeOn = configure(ctx, list, fbZorder);
+    ALOGD_IF(DEBUG_FBUPDATE, "%s, mModeOn = %d", __FUNCTION__, mModeOn);
     return mModeOn;
 }
 
