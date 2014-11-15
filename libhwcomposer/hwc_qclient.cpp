@@ -167,6 +167,9 @@ static status_t getDisplayVisibleRegion(hwc_context_t* ctx, int dpy,
 }
 
 static void pauseWFD(hwc_context_t *ctx, uint32_t pause) {
+    /* TODO: Will remove pauseWFD once all the clients start using
+     * setWfdStatus to indicate the status of WFD display
+     */
     int dpy = HWC_DISPLAY_VIRTUAL;
     if(pause) {
         //WFD Pause
@@ -174,6 +177,44 @@ static void pauseWFD(hwc_context_t *ctx, uint32_t pause) {
     } else {
         //WFD Resume
         handle_resume(ctx, dpy);
+    }
+}
+
+static void setWfdStatus(hwc_context_t *ctx, uint32_t wfdStatus) {
+
+    ALOGD_IF(HWC_WFDDISPSYNC_LOG,
+             "%s: Received a binder call that WFD state is %s",
+             __FUNCTION__,getExternalDisplayState(wfdStatus));
+    int dpy = HWC_DISPLAY_VIRTUAL;
+
+    if(wfdStatus == EXTERNAL_OFFLINE) {
+        ctx->mWfdSyncLock.lock();
+        ctx->mWfdSyncLock.signal();
+        ctx->mWfdSyncLock.unlock();
+    } else if(wfdStatus == EXTERNAL_PAUSE) {
+        handle_pause(ctx, dpy);
+    } else if(wfdStatus == EXTERNAL_RESUME) {
+        handle_resume(ctx, dpy);
+    }
+}
+
+
+static status_t setViewFrame(hwc_context_t* ctx, const Parcel* inParcel) {
+    int dpy = inParcel->readInt32();
+    if(dpy >= HWC_DISPLAY_PRIMARY && dpy <= HWC_DISPLAY_VIRTUAL) {
+        Locker::Autolock _sl(ctx->mDrawLock);
+        ctx->mViewFrame[dpy].left   = inParcel->readInt32();
+        ctx->mViewFrame[dpy].top    = inParcel->readInt32();
+        ctx->mViewFrame[dpy].right  = inParcel->readInt32();
+        ctx->mViewFrame[dpy].bottom = inParcel->readInt32();
+        ALOGD_IF(QCLIENT_DEBUG, "%s: mViewFrame[%d] = [%d %d %d %d]",
+            __FUNCTION__, dpy,
+            ctx->mViewFrame[dpy].left, ctx->mViewFrame[dpy].top,
+            ctx->mViewFrame[dpy].right, ctx->mViewFrame[dpy].bottom);
+        return NO_ERROR;
+    } else {
+        ALOGE("In %s: invalid dpy index %d", __FUNCTION__, dpy);
+        return BAD_VALUE;
     }
 }
 
@@ -214,15 +255,20 @@ status_t QClient::notifyCallback(uint32_t command, const Parcel* inParcel,
             break;
         case IQService::SET_HSIC_DATA:
             setHSIC(mHwcContext, inParcel);
+            break;
         case IQService::PAUSE_WFD:
             pauseWFD(mHwcContext, inParcel->readInt32());
+            break;
+        case IQService::SET_WFD_STATUS:
+            setWfdStatus(mHwcContext,inParcel->readInt32());
+            break;
+        case IQService::SET_VIEW_FRAME:
+            setViewFrame(mHwcContext, inParcel);
             break;
         default:
             ret = NO_ERROR;
     }
     return ret;
 }
-
-
 
 }

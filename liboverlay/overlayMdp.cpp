@@ -132,6 +132,23 @@ void MdpCtrl::setTransform(const utils::eTransform& orient) {
     mOrientation = static_cast<utils::eTransform>(rot);
 }
 
+void MdpCtrl::setPipeType(const utils::eMdpPipeType& pType){
+    switch((int) pType){
+        case utils::OV_MDP_PIPE_RGB:
+            mOVInfo.pipe_type = PIPE_TYPE_RGB;
+            break;
+        case utils::OV_MDP_PIPE_VG:
+            mOVInfo.pipe_type = PIPE_TYPE_VIG;
+            break;
+        case utils::OV_MDP_PIPE_DMA:
+            mOVInfo.pipe_type = PIPE_TYPE_DMA;
+            break;
+        default:
+            mOVInfo.pipe_type = PIPE_TYPE_AUTO;
+            break;
+    }
+}
+
 void MdpCtrl::doTransform() {
     setRotationFlags();
     utils::Whf whf = getSrcWhf();
@@ -194,6 +211,10 @@ bool MdpCtrl::set() {
             if (!(mOVInfo.flags & MDP_SOURCE_ROTATED_90) &&
                 (mOVInfo.src_rect.h % 4))
                 mOVInfo.src_rect.h = utils::aligndown(mOVInfo.src_rect.h, 4);
+            // For interlaced, width must be multiple of 4 when rotated 90deg.
+            else if ((mOVInfo.flags & MDP_SOURCE_ROTATED_90) &&
+                (mOVInfo.src_rect.w % 4))
+                mOVInfo.src_rect.w = utils::aligndown(mOVInfo.src_rect.w, 4);
         }
     } else {
         if (mdpVersion >= MDSS_V5) {
@@ -381,7 +402,8 @@ bool MdpCtrl::validateAndSet(MdpCtrl* mdpCtrlArray[], const int& count,
 #endif
 
     if(!mdp_wrapper::validateAndSet(fbFd, list)) {
-        if(list.processed_overlays < list.num_overlays) {
+        /* No dump for failure due to insufficient resource */
+        if(errno != E2BIG) {
             mdp_wrapper::dump("Bad ov dump: ",
                 *list.overlay_list[list.processed_overlays]);
         }

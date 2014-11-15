@@ -27,6 +27,7 @@
 #include "cb_utils.h"
 #include "cb_swap_rect.h"
 #include "math.h"
+#include "sync/sync.h"
 using namespace qdutils;
 namespace qhwc {
 
@@ -179,7 +180,7 @@ bool CopyBit::prepare(hwc_context_t *ctx, hwc_display_contents_1_t *list,
                 return true;
             hwc_rect_t sourceCrop = integerizeSourceCrop(layer->sourceCropf);
 
-            if (layer->transform & HAL_TRANSFORM_ROT_90) {
+            if (has90Transform(layer)) {
                 src_h = sourceCrop.right - sourceCrop.left;
                 src_w = sourceCrop.bottom - sourceCrop.top;
             } else {
@@ -515,7 +516,7 @@ int  CopyBit::drawLayerUsingCopybit(hwc_context_t *dev, hwc_layer_1_t *layer,
                src.format != HAL_PIXEL_FORMAT_RGBA_8888) {
            format = HAL_PIXEL_FORMAT_RGBX_8888;
        }
-       if (0 == alloc_buffer(&tmpHnd, tmp_w, tmp_h, format, usage)){
+       if (0 == alloc_buffer(&tmpHnd, tmp_w, tmp_h, format, usage) && tmpHnd) {
             copybit_image_t tmp_dst;
             copybit_rect_t tmp_rect;
             tmp_dst.w = tmp_w;
@@ -712,8 +713,8 @@ struct copybit_device_t* CopyBit::getCopyBitDevice() {
     return mEngine;
 }
 
-CopyBit::CopyBit(hwc_context_t *ctx, const int& dpy) : mIsModeOn(false),
-        mCopyBitDraw(false), mCurRenderBufferIndex(0) {
+CopyBit::CopyBit(hwc_context_t *ctx, const int& dpy) : mEngine(0),
+        mIsModeOn(false), mCopyBitDraw(false), mCurRenderBufferIndex(0) {
 
     getBufferSizeAndDimensions(ctx->dpyAttr[dpy].xres,
             ctx->dpyAttr[dpy].yres,

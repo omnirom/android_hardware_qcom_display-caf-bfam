@@ -163,6 +163,11 @@ void MDPComp::reset(hwc_context_t *ctx) {
     ctx->mLayerRotMap[mDpy]->clear();
 }
 
+void MDPComp::reset() {
+    sHandleTimeout = false;
+    mModeOn = false;
+}
+
 void MDPComp::timeout_handler(void *udata) {
     struct hwc_context_t* ctx = (struct hwc_context_t*)(udata);
 
@@ -416,8 +421,8 @@ bool MDPComp::isFrameDoable(hwc_context_t *ctx) {
                   __FUNCTION__);
         ret = false;
     } else if(ctx->isPaddingRound) {
-        ctx->isPaddingRound = false;
-        ALOGD_IF(isDebug(), "%s: padding round",__FUNCTION__);
+        ALOGD_IF(isDebug(), "%s: padding round invoked for dpy %d",
+                 __FUNCTION__,mDpy);
         ret = false;
     }
     return ret;
@@ -480,44 +485,51 @@ bool MDPComp::validateAndApplyROI(hwc_context_t *ctx,
     return true;
 }
 
+bool MDPComp::canDoPartialUpdate(hwc_context_t *ctx,
+                               hwc_display_contents_1_t* list){
+    if(!qdutils::MDPVersion::getInstance().isPartialUpdateEnabled() || mDpy ||
+       isSkipPresent(ctx, mDpy) || (list->flags & HWC_GEOMETRY_CHANGED)||
+       isDisplaySplit(ctx, mDpy)) {
+        return false;
+    }
+    return true;
+}
+
 void MDPComp::generateROI(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     int numAppLayers = ctx->listStats[mDpy].numAppLayers;
 
-    if(!sEnablePartialFrameUpdate) {
-        return;
-    }
-
-    if(mDpy || isDisplaySplit(ctx, mDpy)){
-        ALOGE_IF(isDebug(), "%s: ROI not supported for"
-                 "the (1) external / virtual display's (2) dual DSI displays",
-                 __FUNCTION__);
-        return;
-    }
-
-    if(isSkipPresent(ctx, mDpy))
-        return;
-
-    if(list->flags & HWC_GEOMETRY_CHANGED)
+    if(!canDoPartialUpdate(ctx, list))
         return;
 
     struct hwc_rect roi = (struct hwc_rect){0, 0, 0, 0};
     for(int index = 0; index < numAppLayers; index++ ) {
-        if ((mCachedFrame.hnd[index] != list->hwLayers[index].handle) ||
-            isYuvBuffer((private_handle_t *)list->hwLayers[index].handle)) {
-            hwc_rect_t dstRect = list->hwLayers[index].displayFrame;
-            hwc_rect_t srcRect = integerizeSourceCrop(
-                                        list->hwLayers[index].sourceCropf);
-            int transform = list->hwLayers[index].transform;
+        hwc_layer_1_t* layer = &list->hwLayers[index];
+        if ((mCachedFrame.hnd[index] != layer->handle) ||
+                isYuvBuffer((private_handle_t *)layer->handle)) {
+            hwc_rect_t dst = layer->displayFrame;
+            hwc_rect_t updatingRect = dst;
 
-            /* Intersect against display boundaries */
-            roi = getUnion(roi, dstRect);
+#ifdef QCOM_BSP
+            if(!needsScaling(layer) && !layer->transform)
+            {
+                hwc_rect_t src = integerizeSourceCrop(layer->sourceCropf);
+                int x_off = dst.left - src.left;
+                int y_off = dst.top - src.top;
+                updatingRect = moveRect(layer->dirtyRect, x_off, y_off);
+            }
+#endif
+            roi = getUnion(roi, updatingRect);
         }
     }
 
-    if(!validateAndApplyROI(ctx, list, roi)){
-        roi = (struct hwc_rect) {0, 0,
-                    (int)ctx->dpyAttr[mDpy].xres, (int)ctx->dpyAttr[mDpy].yres};
-    }
+    hwc_rect fullFrame = (struct hwc_rect) {0, 0,(int)ctx->dpyAttr[mDpy].xres,
+        (int)ctx->dpyAttr[mDpy].yres};
+
+    // Align ROI coordinates to panel restrictions
+    roi = sanitizeROI(roi, fullFrame);
+
+    if(!validateAndApplyROI(ctx, list, roi))
+        roi = fullFrame;
 
     ctx->listStats[mDpy].roi.x = roi.left;
     ctx->listStats[mDpy].roi.y = roi.top;
@@ -568,9 +580,10 @@ bool MDPComp::tryFullFrame(hwc_context_t *ctx,
 
         //For 8x26 with panel width>1k, if RGB layer needs HFLIP fail mdp comp
         // may not need it if Gfx pre-rotation can handle all flips & rotations
+        int transform = (layer->flags & HWC_COLOR_FILL) ? 0 : layer->transform;
         if(qdutils::MDPVersion::getInstance().is8x26() &&
                                 (ctx->dpyAttr[mDpy].xres > 1024) &&
-                                (layer->transform & HWC_TRANSFORM_FLIP_H) &&
+                                (transform & HWC_TRANSFORM_FLIP_H) &&
                                 (!isYuvBuffer(hnd)))
                    return false;
     }
@@ -605,15 +618,6 @@ bool MDPComp::fullMDPComp(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
             ALOGD_IF(isDebug(), "%s: Unsupported layer in list",__FUNCTION__);
             return false;
         }
-
-        //For 8x26, if there is only one layer which needs scale for secondary
-        //while no scale for primary display, DMA pipe is occupied by primary.
-        //If need to fall back to GLES composition, virtual display lacks DMA
-        //pipe and error is reported.
-        if(qdutils::MDPVersion::getInstance().is8x26() &&
-                                mDpy >= HWC_DISPLAY_EXTERNAL &&
-                                qhwc::needsScaling(layer))
-            return false;
     }
 
     mCurrentFrame.fbCount = 0;
@@ -1222,14 +1226,20 @@ bool MDPComp::hwLimitationsCheck(hwc_context_t* ctx,
 
 int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     int ret = 0;
+
+    if(!ctx || !list) {
+        ALOGE("%s: Invalid context or list",__FUNCTION__);
+        mCachedFrame.reset();
+        return -1;
+    }
+
     const int numLayers = ctx->listStats[mDpy].numAppLayers;
     MDPVersion& mdpVersion = qdutils::MDPVersion::getInstance();
 
-    //number of app layers exceeds MAX_NUM_APP_LAYERS fall back to GPU
-    //do not cache the information for next draw cycle.
-    if(numLayers > MAX_NUM_APP_LAYERS) {
-        ALOGI("%s: Number of App layers exceeded the limit ",
-        __FUNCTION__);
+    //Do not cache the information for next draw cycle.
+    if(numLayers > MAX_NUM_APP_LAYERS or (!numLayers)) {
+        ALOGI("%s: Unsupported layer count for mdp composition",
+                __FUNCTION__);
         mCachedFrame.reset();
         return -1;
     }
@@ -1259,7 +1269,8 @@ int MDPComp::prepare(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
     if(isFrameDoable(ctx)) {
         generateROI(ctx, list);
 
-        if(tryFullFrame(ctx, list) || tryVideoOnly(ctx, list)) {
+        mModeOn = tryFullFrame(ctx, list) || tryVideoOnly(ctx, list);
+        if(mModeOn) {
             setMDPCompLayerFlags(ctx, list);
         } else {
             reset(ctx);
@@ -1329,12 +1340,23 @@ void MDPCompNonSplit::adjustForSourceSplit(hwc_context_t *ctx,
     //as we split 4k2k layer and increment zorder for right half
     //of the layer
     if(mCurrentFrame.fbZ >= 0) {
-        int n4k2kYuvCount = ctx->listStats[mDpy].yuv4k2kCount;
-        for(int index = 0; index < n4k2kYuvCount; index++){
-            int n4k2kYuvIndex =
-                    ctx->listStats[mDpy].yuv4k2kIndices[index];
-            if(mCurrentFrame.fbZ > n4k2kYuvIndex){
-                mCurrentFrame.fbZ += 1;
+        for (int index = 0, mdpNextZOrder = 0; index < mCurrentFrame.layerCount;
+                index++) {
+            if(!mCurrentFrame.isFBComposed[index]) {
+                if(mdpNextZOrder == mCurrentFrame.fbZ) {
+                    mdpNextZOrder++;
+                }
+                mdpNextZOrder++;
+                hwc_layer_1_t* layer = &list->hwLayers[index];
+                private_handle_t *hnd = (private_handle_t *)layer->handle;
+                if(is4kx2kYuvBuffer(hnd)) {
+                    if(mdpNextZOrder <= mCurrentFrame.fbZ)
+                        mCurrentFrame.fbZ += 1;
+                    mdpNextZOrder++;
+                    //As we split 4kx2k yuv layer and program to 2 VG pipes
+                    //(if available) increase mdpcount by 1.
+                    mCurrentFrame.mdpCount++;
+                }
             }
         }
     }
@@ -1392,6 +1414,17 @@ bool MDPCompNonSplit::allocLayerPipes(hwc_context_t *ctx,
             type = MDPCOMP_OV_DMA;
         }
 
+        // for 8x26, never allow primary display occupy DMA pipe
+        // when external display is connected
+        if(qdutils::MDPVersion::getInstance().is8x26()
+            && ctx->dpyAttr[HWC_DISPLAY_VIRTUAL].isActive
+            && ctx->dpyAttr[HWC_DISPLAY_VIRTUAL].connected
+            && !ctx->dpyAttr[HWC_DISPLAY_VIRTUAL].isPause
+            && mDpy == HWC_DISPLAY_PRIMARY
+            && type == MDPCOMP_OV_DMA) {
+            type = MDPCOMP_OV_RGB;
+        }
+
         pipe_info.index = getMdpPipe(ctx, type, Overlay::MIXER_DEFAULT);
         if(pipe_info.index == ovutils::OV_INVALID) {
             ALOGD_IF(isDebug(), "%s: Unable to get pipe type = %d",
@@ -1418,18 +1451,8 @@ int MDPCompNonSplit::configure4k2kYuv(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
 bool MDPCompNonSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
 
-    if(!isEnabled()) {
-        ALOGD_IF(isDebug(),"%s: MDP Comp not configured", __FUNCTION__);
-        return true;
-    }
-
-    if(!ctx || !list) {
-        ALOGE("%s: invalid contxt or list",__FUNCTION__);
-        return false;
-    }
-
-    if(ctx->listStats[mDpy].numAppLayers > MAX_NUM_APP_LAYERS) {
-        ALOGD_IF(isDebug(),"%s: Exceeding max layer count", __FUNCTION__);
+    if(!isEnabled() or !mModeOn) {
+        ALOGD_IF(isDebug(),"%s: MDP Comp not enabled/configured", __FUNCTION__);
         return true;
     }
 
@@ -1542,17 +1565,27 @@ void MDPCompSplit::adjustForSourceSplit(hwc_context_t *ctx,
          hwc_display_contents_1_t* list){
     //if 4kx2k yuv layer is totally present in either in left half
     //or right half then try splitting the yuv layer to avoid decimation
-    int n4k2kYuvCount = ctx->listStats[mDpy].yuv4k2kCount;
     const int lSplit = getLeftSplit(ctx, mDpy);
-    for(int index = 0; index < n4k2kYuvCount; index++){
-        int n4k2kYuvIndex = ctx->listStats[mDpy].yuv4k2kIndices[index];
-        hwc_layer_1_t* layer = &list->hwLayers[n4k2kYuvIndex];
-        hwc_rect_t dst = layer->displayFrame;
-        if((dst.left > lSplit) || (dst.right < lSplit)) {
-            mCurrentFrame.mdpCount += 1;
-        }
-        if(mCurrentFrame.fbZ > n4k2kYuvIndex){
-            mCurrentFrame.fbZ += 1;
+    if(mCurrentFrame.fbZ >= 0) {
+        for (int index = 0, mdpNextZOrder = 0; index < mCurrentFrame.layerCount;
+                index++) {
+            if(!mCurrentFrame.isFBComposed[index]) {
+                if(mdpNextZOrder == mCurrentFrame.fbZ) {
+                    mdpNextZOrder++;
+                }
+                mdpNextZOrder++;
+                hwc_layer_1_t* layer = &list->hwLayers[index];
+                private_handle_t *hnd = (private_handle_t *)layer->handle;
+                if(is4kx2kYuvBuffer(hnd)) {
+                    hwc_rect_t dst = layer->displayFrame;
+                    if((dst.left > lSplit) || (dst.right < lSplit)) {
+                        mCurrentFrame.mdpCount += 1;
+                    }
+                    if(mdpNextZOrder <= mCurrentFrame.fbZ)
+                        mCurrentFrame.fbZ += 1;
+                    mdpNextZOrder++;
+                }
+            }
         }
     }
 }
@@ -1666,18 +1699,8 @@ int MDPCompSplit::configure(hwc_context_t *ctx, hwc_layer_1_t *layer,
 
 bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
 
-    if(!isEnabled()) {
-        ALOGD_IF(isDebug(),"%s: MDP Comp not configured", __FUNCTION__);
-        return true;
-    }
-
-    if(!ctx || !list) {
-        ALOGE("%s: invalid contxt or list",__FUNCTION__);
-        return false;
-    }
-
-    if(ctx->listStats[mDpy].numAppLayers > MAX_NUM_APP_LAYERS) {
-        ALOGD_IF(isDebug(),"%s: Exceeding max layer count", __FUNCTION__);
+    if(!isEnabled() or !mModeOn) {
+        ALOGD_IF(isDebug(),"%s: MDP Comp not enabled/configured", __FUNCTION__);
         return true;
     }
 
@@ -1754,11 +1777,9 @@ bool MDPCompSplit::draw(hwc_context_t *ctx, hwc_display_contents_1_t* list) {
             int fd = hnd->fd;
             int offset = hnd->offset;
 
-            if(ctx->mAD->isModeOn()) {
-                if(ctx->mAD->draw(ctx, fd, offset)) {
-                    fd = ctx->mAD->getDstFd(ctx);
-                    offset = ctx->mAD->getDstOffset(ctx);
-                }
+            if(ctx->mAD->draw(ctx, fd, offset)) {
+                fd = ctx->mAD->getDstFd(ctx);
+                offset = ctx->mAD->getDstOffset(ctx);
             }
 
             if(rot) {
