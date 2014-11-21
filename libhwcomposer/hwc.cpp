@@ -132,21 +132,19 @@ static void setDMAState(hwc_context_t *ctx, int numDisplays,
     if(ctx->mRotMgr->getNumActiveSessions() == 0)
         Overlay::setDMAMode(Overlay::DMA_LINE_MODE);
 
-    for(int dpy = 0; dpy < numDisplays; dpy++) {
-        hwc_display_contents_1_t *list = displays[dpy];
+    for(int i = 0; i < numDisplays; i++) {
+        hwc_display_contents_1_t *list = displays[i];
         if (LIKELY(list && list->numHwLayers > 0)) {
-            for(size_t layerIndex = 0; layerIndex < list->numHwLayers;
-                                                  layerIndex++) {
-                if(list->hwLayers[layerIndex].compositionType !=
-                                            HWC_FRAMEBUFFER_TARGET)
+            for(uint32_t j = 0; j < list->numHwLayers; j++) {
+                if(list->hwLayers[j].compositionType != HWC_FRAMEBUFFER_TARGET)
                 {
-                    hwc_layer_1_t const* layer = &list->hwLayers[layerIndex];
+                    hwc_layer_1_t const* layer = &list->hwLayers[i];
                     private_handle_t *hnd = (private_handle_t *)layer->handle;
 
                     /* If a video layer requires rotation, set the DMA state
                      * to BLOCK_MODE */
 
-                    if (UNLIKELY(isYuvBuffer(hnd)) && canUseRotator(ctx, dpy) &&
+                    if (UNLIKELY(isYuvBuffer(hnd)) && canUseRotator(ctx,i) &&
                         (layer->transform & HWC_TRANSFORM_ROT_90)) {
                         if(not (qdutils::MDPVersion::getInstance().is8x26() &&
                                              dpy)) {
@@ -158,7 +156,7 @@ static void setDMAState(hwc_context_t *ctx, int numDisplays,
                     }
                 }
             }
-            if(dpy) {
+            if(i) {
                 /* Uncomment the below code for testing purpose.
                    Assuming the orientation value is in terms of HAL_TRANSFORM,
                    this needs mapping to HAL, if its in different convention */
