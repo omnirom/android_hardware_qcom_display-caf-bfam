@@ -283,16 +283,16 @@ inline bool wbDequeueBuffer(int fbfd, struct msmfb_data& fbData) {
 
 /* dump funcs */
 inline void dump(const char* const s, const msmfb_overlay_data& ov) {
-    ALOGE("%s msmfb_overlay_data id=%d",
+    ALOGV("%s msmfb_overlay_data id=%d",
             s, ov.id);
     dump("data", ov.data);
 }
 inline void dump(const char* const s, const msmfb_data& ov) {
-    ALOGE("%s msmfb_data offset=%d memid=%d id=%d flags=0x%x priv=%d",
+    ALOGV("%s msmfb_data offset=%d memid=%d id=%d flags=0x%x priv=%d",
             s, ov.offset, ov.memory_id, ov.id, ov.flags, ov.priv);
 }
 inline void dump(const char* const s, const mdp_overlay& ov) {
-    ALOGE("%s mdp_overlay z=%d fg=%d alpha=%d mask=%d flags=0x%x id=%d",
+    ALOGV("%s mdp_overlay z=%d fg=%d alpha=%d mask=%d flags=0x%x id=%d",
             s, ov.z_order, ov.is_fg, ov.alpha,
             ov.transp_mask, ov.flags, ov.id);
     dump("src", ov.src);
@@ -306,28 +306,28 @@ inline void dump(const char* const s, const mdp_overlay& ov) {
     */
 }
 inline void dump(const char* const s, const msmfb_img& ov) {
-    ALOGE("%s msmfb_img w=%d h=%d format=%d %s",
+    ALOGV("%s msmfb_img w=%d h=%d format=%d %s",
             s, ov.width, ov.height, ov.format,
             overlay::utils::getFormatString(ov.format));
 }
 inline void dump(const char* const s, const mdp_rect& ov) {
-    ALOGE("%s mdp_rect x=%d y=%d w=%d h=%d",
+    ALOGV("%s mdp_rect x=%d y=%d w=%d h=%d",
             s, ov.x, ov.y, ov.w, ov.h);
 }
 
 inline void dump(const char* const s, const msmfb_overlay_3d& ov) {
-    ALOGE("%s msmfb_overlay_3d 3d=%d w=%d h=%d",
+    ALOGV("%s msmfb_overlay_3d 3d=%d w=%d h=%d",
             s, ov.is_3d, ov.width, ov.height);
 
 }
 inline void dump(const char* const s, const uint32_t u[], uint32_t cnt) {
-    ALOGE("%s user_data cnt=%d", s, cnt);
+    ALOGV("%s user_data cnt=%d", s, cnt);
     for(uint32_t i=0; i < cnt; ++i) {
-        ALOGE("i=%d val=%d", i, u[i]);
+        ALOGV("i=%d val=%d", i, u[i]);
     }
 }
 inline void dump(const char* const s, const msm_rotator_img_info& rot) {
-    ALOGE("%s msm_rotator_img_info sessid=%u dstx=%d dsty=%d rot=%d, ena=%d scale=%d",
+    ALOGV("%s msm_rotator_img_info sessid=%u dstx=%d dsty=%d rot=%d, ena=%d scale=%d",
             s, rot.session_id, rot.dst_x, rot.dst_y,
             rot.rotations, rot.enable, rot.downscale_ratio);
     dump("src", rot.src);
@@ -335,7 +335,7 @@ inline void dump(const char* const s, const msm_rotator_img_info& rot) {
     dump("src_rect", rot.src_rect);
 }
 inline void dump(const char* const s, const msm_rotator_data_info& rot) {
-    ALOGE("%s msm_rotator_data_info sessid=%u verkey=%d",
+    ALOGV("%s msm_rotator_data_info sessid=%u verkey=%d",
             s, rot.session_id, rot.version_key);
     dump("src", rot.src);
     dump("dst", rot.dst);
@@ -343,10 +343,10 @@ inline void dump(const char* const s, const msm_rotator_data_info& rot) {
     dump("dst_chroma", rot.dst_chroma);
 }
 inline void dump(const char* const s, const fb_fix_screeninfo& finfo) {
-    ALOGE("%s fb_fix_screeninfo type=%d", s, finfo.type);
+    ALOGV("%s fb_fix_screeninfo type=%d", s, finfo.type);
 }
 inline void dump(const char* const s, const fb_var_screeninfo& vinfo) {
-    ALOGE("%s fb_var_screeninfo xres=%d yres=%d",
+    ALOGV("%s fb_var_screeninfo xres=%d yres=%d",
             s, vinfo.xres, vinfo.yres);
 }
 
