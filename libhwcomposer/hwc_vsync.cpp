@@ -70,7 +70,7 @@ static void handle_blank_event(hwc_context_t* ctx, int dpy, char *data)
 {
     if (!strncmp(data, PANEL_ON_STR, strlen(PANEL_ON_STR))) {
         uint32_t poweron = strtoul(data + strlen(PANEL_ON_STR), NULL, 0);
-        ALOGI("%s: dpy:%d panel power state: %d", __FUNCTION__, dpy, poweron);
+        ALOGD_IF (logvsync, "%s: dpy:%d panel power state: %d", __FUNCTION__, dpy, poweron);
         ctx->dpyAttr[dpy].isActive = poweron ? true: false;
     }
 }
