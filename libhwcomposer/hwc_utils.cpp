@@ -792,11 +792,9 @@ void setListStats(hwc_context_t *ctx,
         private_handle_t *hnd = (private_handle_t *)layer->handle;
 
 #ifdef QCOM_BSP
-#ifndef QCOM_MDP_DISABLE_CHECK_FOR_ANIMATION
         if (layer->flags & HWC_SCREENSHOT_ANIMATOR_LAYER) {
             ctx->listStats[dpy].isDisplayAnimating = true;
         }
-#endif
         if(isSecureDisplayBuffer(hnd)) {
             ctx->listStats[dpy].secureUI = true;
         }
