@@ -120,12 +120,6 @@ bool FBUpdateNonSplit::configure(hwc_context_t *ctx, hwc_display_contents_1 *lis
     bool ret = false;
     hwc_layer_1_t *layer = &list->hwLayers[list->numHwLayers - 1];
     if (LIKELY(ctx->mOverlay)) {
-        int extOnlyLayerIndex = ctx->listStats[mDpy].extOnlyLayerIndex;
-        // ext only layer present..
-        if(extOnlyLayerIndex != -1) {
-            layer = &list->hwLayers[extOnlyLayerIndex];
-            layer->compositionType = HWC_OVERLAY;
-        }
         overlay::Overlay& ov = *(ctx->mOverlay);
 
         ovutils::Whf info(mAlignedFBWidth,
@@ -138,7 +132,8 @@ bool FBUpdateNonSplit::configure(hwc_context_t *ctx, hwc_display_contents_1 *lis
             //For 8x26 external always use DMA pipe
             type = ovutils::OV_MDP_PIPE_DMA;
         }
-        ovutils::eDest dest = ov.nextPipe(type, mDpy, Overlay::MIXER_DEFAULT);
+        ovutils::eDest dest = ov.nextPipe(type, mDpy, Overlay::MIXER_DEFAULT,
+                                          Overlay::FORMAT_RGB);
         if(dest == ovutils::OV_INVALID) { //None available
             ALOGE("%s: No pipes available to configure fb for dpy %d",
                 __FUNCTION__, mDpy);
@@ -176,8 +171,7 @@ bool FBUpdateNonSplit::configure(hwc_context_t *ctx, hwc_display_contents_1 *lis
             displayFrame = sourceCrop;
         } else if((!mDpy ||
                    (mDpy && !extOrient
-                   && !ctx->dpyAttr[mDpy].mDownScaleMode))
-                   && (extOnlyLayerIndex == -1)) {
+                   && !ctx->dpyAttr[mDpy].mDownScaleMode))) {
             if(!qdutils::MDPVersion::getInstance().is8x26()) {
                 getNonWormholeRegion(list, sourceCrop);
                 displayFrame = sourceCrop;
@@ -268,12 +262,6 @@ bool FBUpdateSplit::configure(hwc_context_t *ctx,
     bool ret = false;
     hwc_layer_1_t *layer = &list->hwLayers[list->numHwLayers - 1];
     if (LIKELY(ctx->mOverlay)) {
-        int extOnlyLayerIndex = ctx->listStats[mDpy].extOnlyLayerIndex;
-        // ext only layer present..
-        if(extOnlyLayerIndex != -1) {
-            layer = &list->hwLayers[extOnlyLayerIndex];
-            layer->compositionType = HWC_OVERLAY;
-        }
         overlay::Overlay& ov = *(ctx->mOverlay);
 
         ovutils::Whf info(mAlignedFBWidth,
@@ -282,7 +270,7 @@ bool FBUpdateSplit::configure(hwc_context_t *ctx,
 
         //Request left pipe
         ovutils::eDest destL = ov.nextPipe(ovutils::OV_MDP_PIPE_ANY, mDpy,
-                Overlay::MIXER_LEFT);
+                Overlay::MIXER_LEFT, Overlay::FORMAT_RGB);
         if(destL == ovutils::OV_INVALID) { //None available
             ALOGE("%s: No pipes available to configure fb for dpy %d's left"
                     " mixer", __FUNCTION__, mDpy);
@@ -290,7 +278,7 @@ bool FBUpdateSplit::configure(hwc_context_t *ctx,
         }
         //Request right pipe
         ovutils::eDest destR = ov.nextPipe(ovutils::OV_MDP_PIPE_ANY, mDpy,
-                Overlay::MIXER_RIGHT);
+                Overlay::MIXER_RIGHT, Overlay::FORMAT_RGB);
         if(destR == ovutils::OV_INVALID) { //None available
             ALOGE("%s: No pipes available to configure fb for dpy %d's right"
                     " mixer", __FUNCTION__, mDpy);
@@ -413,5 +401,4 @@ bool FBUpdateSplit::draw(hwc_context_t *ctx, private_handle_t *hnd)
     return ret;
 }
 
-//---------------------------------------------------------------------
 }; //namespace qhwc

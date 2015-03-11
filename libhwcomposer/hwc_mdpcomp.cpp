@@ -386,13 +386,15 @@ ovutils::eDest MDPComp::getMdpPipe(hwc_context_t *ctx, ePipeType type,
 
     switch(type) {
     case MDPCOMP_OV_DMA:
-        mdp_pipe = ov.nextPipe(ovutils::OV_MDP_PIPE_DMA, mDpy, mixer);
+        mdp_pipe = ov.nextPipe(ovutils::OV_MDP_PIPE_DMA, mDpy, mixer,
+                               Overlay::FORMAT_RGB);
         if(mdp_pipe != ovutils::OV_INVALID) {
             return mdp_pipe;
         }
     case MDPCOMP_OV_ANY:
     case MDPCOMP_OV_RGB:
-        mdp_pipe = ov.nextPipe(ovutils::OV_MDP_PIPE_RGB, mDpy, mixer);
+        mdp_pipe = ov.nextPipe(ovutils::OV_MDP_PIPE_RGB, mDpy, mixer,
+                               Overlay::FORMAT_RGB);
         if(mdp_pipe != ovutils::OV_INVALID) {
             return mdp_pipe;
         }
@@ -402,7 +404,8 @@ ovutils::eDest MDPComp::getMdpPipe(hwc_context_t *ctx, ePipeType type,
             break;
         }
     case  MDPCOMP_OV_VG:
-        return ov.nextPipe(ovutils::OV_MDP_PIPE_VG, mDpy, mixer);
+        return ov.nextPipe(ovutils::OV_MDP_PIPE_VG, mDpy, mixer,
+                           Overlay::FORMAT_YUV);
     default:
         ALOGE("%s: Invalid pipe type",__FUNCTION__);
         return ovutils::OV_INVALID;
@@ -424,8 +427,7 @@ bool MDPComp::isFrameDoable(hwc_context_t *ctx) {
         ALOGD_IF(isDebug(),"%s: MDP Comp. video transition padding round",
                 __FUNCTION__);
         ret = false;
-    } else if(ctx->dpyAttr[HWC_DISPLAY_EXTERNAL].isConfiguring ||
-              ctx->dpyAttr[HWC_DISPLAY_VIRTUAL].isConfiguring) {
+    } else if(isSecondaryConfiguring(ctx)) {
         ALOGD_IF( isDebug(),"%s: External Display connection is pending",
                   __FUNCTION__);
         ret = false;
@@ -823,7 +825,7 @@ bool MDPComp::fullMDPCompWithPTOR(hwc_context_t *ctx,
             // Update layer attributes
             hwc_rect_t srcCrop = integerizeSourceCrop(layer->sourceCropf);
             hwc_rect_t destRect = deductRect(layer->displayFrame,
-                                             overlapRect[j]);
+                        getIntersection(layer->displayFrame, overlapRect[j]));
             qhwc::calculate_crop_rects(srcCrop, layer->displayFrame, destRect,
                                        layer->transform);
             layer->sourceCropf.left = (float)srcCrop.left;
@@ -837,8 +839,14 @@ bool MDPComp::fullMDPCompWithPTOR(hwc_context_t *ctx,
     mCurrentFrame.fbCount = 0;
     mCurrentFrame.fbZ = -1;
 
-    for (int j = 0; j < numAppLayers; j++)
-        mCurrentFrame.isFBComposed[j] = false;
+    for (int j = 0; j < numAppLayers; j++) {
+        if(isValidRect(list->hwLayers[j].displayFrame)) {
+            mCurrentFrame.isFBComposed[j] = false;
+        } else {
+            mCurrentFrame.mdpCount--;
+            mCurrentFrame.drop[j] = true;
+        }
+    }
 
     bool result = postHeuristicsHandling(ctx, list);
 
@@ -1078,6 +1086,11 @@ bool MDPComp::videoOnlyComp(hwc_context_t *ctx,
 
     if(!postHeuristicsHandling(ctx, list)) {
         ALOGD_IF(isDebug(), "post heuristic handling failed");
+        if(errno == ENOBUFS) {
+            ALOGD_IF(isDebug(), "SMP Allocation failed");
+            //On SMP allocation failure in video only comp add padding round
+            ctx->isPaddingRound = true;
+        }
         reset(ctx);
         return false;
     }

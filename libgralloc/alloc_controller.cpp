@@ -73,13 +73,18 @@ static bool canFallback(int usage, bool triedSystem)
     return true;
 }
 
-static bool useUncached(int usage)
-{
-    if (usage & GRALLOC_USAGE_PRIVATE_UNCACHED)
+/* The default policy is to return cached buffers unless the client explicity
+ * sets the PRIVATE_UNCACHED flag or indicates that the buffer will be rarely
+ * read or written in software. Any combination with a _RARELY_ flag will be
+ * treated as uncached. */
+static bool useUncached(const int& usage) {
+    if((usage & GRALLOC_USAGE_PRIVATE_UNCACHED) or
+            ((usage & GRALLOC_USAGE_SW_WRITE_MASK) ==
+            GRALLOC_USAGE_SW_WRITE_RARELY) or
+            ((usage & GRALLOC_USAGE_SW_READ_MASK) ==
+            GRALLOC_USAGE_SW_READ_RARELY))
         return true;
-    if(((usage & GRALLOC_USAGE_SW_WRITE_MASK) == GRALLOC_USAGE_SW_WRITE_RARELY)
-       ||((usage & GRALLOC_USAGE_SW_READ_MASK) == GRALLOC_USAGE_SW_READ_RARELY))
-        return true;
+
     return false;
 }
 

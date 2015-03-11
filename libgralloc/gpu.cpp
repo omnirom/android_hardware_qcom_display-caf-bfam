@@ -140,6 +140,17 @@ int gpu_context_t::gralloc_alloc_buffer(size_t size, int usage,
             flags |= private_handle_t::PRIV_FLAGS_SECURE_DISPLAY;
         }
 
+        if (usage & (GRALLOC_USAGE_HW_VIDEO_ENCODER |
+                GRALLOC_USAGE_HW_CAMERA_WRITE |
+                GRALLOC_USAGE_HW_RENDER |
+                GRALLOC_USAGE_HW_FB)) {
+            flags |= private_handle_t::PRIV_FLAGS_NON_CPU_WRITER;
+        }
+
+        if(false == data.uncached) {
+            flags |= private_handle_t::PRIV_FLAGS_CACHED;
+        }
+
         flags |= data.allocType;
         int eBaseAddr = int(eData.base) + eData.offset;
         private_handle_t *hnd = new private_handle_t(data.fd, size, flags,
